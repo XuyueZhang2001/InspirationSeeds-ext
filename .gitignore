@@ -129,3 +129,9 @@ test_decompose*/
 
 # Local virtual environment
 seeds-env/
+
+# Grouping / generation / probe outputs
+hf_groups*/
+hf_generated/
+probe/
+test_quality/
