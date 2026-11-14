@@ -127,11 +127,12 @@ hf_decomposed/
 hf_samples/
 outputs*/
 test_decompose*/
+hf_generate_source/
 
 # Local virtual environment
 seeds-env/
 
-# Grouping / generation / probe outputs
+# Grouping / generation / probe outputs / synthesize data
 hf_groups*/
 hf_generated/
 probe/

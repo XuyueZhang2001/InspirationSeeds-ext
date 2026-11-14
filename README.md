@@ -2,10 +2,10 @@
 
 This repository builds on [Inspiration Seeds](https://arxiv.org/abs/2602.08615) (Goldberg, Richardson, Vinker), which combines two input images into a new object using FLUX.1 Kontext with a LoRA trained on synthetic triplets. The triplets come from decomposing a source image into two concept clusters of CLIP-SAE features.
 
-The long-term goal of this fork is to support **N input images with controllable per-image weights**. The current stage covers the data side:
+The long-term goal of this fork is to support **N input images with an optional designated main subject** (earlier plan: controllable per-image weight levels). The current stage covers the data side:
 
-1. decomposing a source image into **N semantically distinct reference images** (N = 2–4, chosen per image). The current recommended script is **`decompose_v7_2.py`** (adaptive SAE feature grouping + an image-space subject subspace); `decompose.py` is the earlier fixed-K baseline;
-2. synthesizing weighted target images from a decomposition (`synthesize_target.py`, currently for `decompose.py` outputs), and checking whether the weights are visible in the generated targets.
+1. decomposing a source image into **N semantically distinct reference images** (N = 2–4, chosen per image). The current recommended script is **`decompose_v7_2.py`** (adaptive SAE feature grouping + an image-space subject subspace);
+2. synthesizing **designated-subject target images** from a decomposition (**`synthesize_v2_1.py`**): for every input designated as the main subject, a target pulled toward that input, so that the same input set gives different targets for different designations.
 
 Last README update: 2026-11-14.
 
@@ -19,8 +19,10 @@ Last README update: 2026-11-14.
 | `decompose_original.py` | Original two-cluster decomposition script (unchanged, renamed) |
 | **`decompose_v7_2.py`** | **Recommended** decomposition: adaptive grouping of SAE features, coverage expansion, merging, shared-part weakening, subject kept in one input (see below) |
 | `decompose_groups.py`, `decompose_v4.py` … `decompose_v7_1.py` | Earlier versions of the adaptive decomposition, kept for comparison (history below) |
-| `decompose.py` | Fixed-K baseline (k-means into K = 2, 3, 4 clusters), saves embeddings and metadata |
-| `synthesize_target.py` | **New** weighted target synthesis from `decompose.py` outputs, with an input-similarity rank check |
+| `decompose.py` | Earlier fixed-K baseline (k-means into K = 2, 3, 4 clusters); no longer documented |
+| **`synthesize_v2_1.py`** | **Recommended** designated-subject target synthesis for `decompose_v7_2.py` outputs: closeness-dependent 2 × 2 grid of interpolation weight × img2img strength (see below) |
+| `synthesize_v2.py` | Previous version: the same synthesis with a full 3 × 3 grid for every main |
+| `synthesize_target.py` | Earlier level-based weighted target synthesis for `decompose.py` outputs |
 | `fetch_hf_samples.py` | Downloads a random subset of the paper's training data from Hugging Face |
 | `probe_inputs.py` | Checks whether the released model uses both inputs (swap / duplicate / blank conditions, DINOv2 and CLIP metrics) |
 | `summarize_none.py` | Prints a table of the unweighted (`none`) target measurements across folders |
@@ -36,6 +38,7 @@ Last README update: 2026-11-14.
 
 - An NVIDIA GPU is required (both scripts hard-code `cuda`).
 - `decompose*.py` (Kandinsky 2.2 + SAE): about 12–16 GB of VRAM.
+- `synthesize_v2_1.py` (Kandinsky 2.2 only, no SAE): at most the same as the decomposition.
 - `generate.py` (FLUX.1 Kontext dev, ~12B parameters, bf16): about 24 GB+ of VRAM, or use `pipe.enable_model_cpu_offload()`.
 
 ### Environment
@@ -283,7 +286,7 @@ One folder per image: `<output-dir>/{image stem}_topk{top-k}_nmax{n-max}/` (the 
 | Version | Change |
 |---|---|
 | `decompose_original.py` | Paper: k-means into 2 clusters, cleaning, $e \pm \lambda(d_1 - d_0)$ |
-| `decompose.py` | K clusters, one-vs-rest directions (baseline below) |
+| `decompose.py` | K clusters, one-vs-rest directions (fixed-K baseline) |
 | `decompose_groups.py` v1 | Adaptive grouping (FINCH + ConceptExpress threshold) |
 | v2 | Quantile threshold capped at 0.9 (max-based threshold merged everything) |
 | v3 | Main/minor groups, cleaning, "remove other groups" inputs ($\beta$, $\gamma$), 50 steps / 768 px |
@@ -296,150 +299,130 @@ One folder per image: `<output-dir>/{image stem}_topk{top-k}_nmax{n-max}/` (the 
 
 ---
 
-## Fixed-K baseline (`decompose.py`)
+## Designated-subject target synthesis (`synthesize_v2_1.py`)
+
+### Goal
+
+The per-image weight levels (`high` / `medium` / `low`) of the earlier `synthesize_target.py` are replaced by an **optional designated main subject**: the user either designates one input as the main subject, or designates none. The training data therefore contains two kinds of samples:
+
+| Kind | Inputs | Designation | Target |
+|---|---|---|---|
+| Unspecified | decomposed inputs | none | the real source image |
+| Designated | decomposed inputs | input $k$ | a synthesized image pulled toward input $k$ (this script) |
+
+Designating different inputs of the same input set gives different targets, i.e. **counterfactual samples**: the model has to read the designation instead of inferring the main subject from the images. The designated input should dominate the target and keep its rough shape and pose, while the other inputs still contribute; its exact shape does not have to be preserved (a designed sofa need not match the input sofa), and its category does not have to be preserved either.
 
 ### Method
 
-For each source image, value of K, top-k and cleaning fraction:
+Input: decomposition folders written by `decompose_v7_2.py` (2–4 inputs per folder): `embeds.pt` (`e`, `e_inputs`), `input_0.jpeg` …, `recon.jpeg`, and optionally `groups.json` (subject and keeper, only used for display). $f(\cdot)$ is the CLIP image encoder of the Kandinsky 2.2 prior.
 
-1. **Encode**: CLIP image embedding $e$ (Kandinsky 2.2 prior, 1280-d); SAE-encode $e$ and keep the top-k features.
-2. **Cluster**: decode each feature as a one-hot vector and run k-means with K clusters on these directions. K = 2 uses the original setting (`n_init="auto"`); K > 2 uses 10 restarts.
-3. **Clean**: for each feature, compute its distance to the nearest *other* cluster center; within each cluster, remove the given fraction of features with the smallest such distance. For K = 2 this is identical to the original script.
-4. **Contributions**: $d_i = W_{dec}\, s_i$ (computed with `model.decoder`, which has no bias), residual $r = e - \sum_i d_i$, natural proportions $m_i = \lVert d_i\rVert / \sum_j \lVert d_j\rVert$.
-5. **One-vs-rest direction**: $v_i = d_i - \frac{1}{K-1}\sum_{j \ne i} d_j$.
-6. **Input embedding**: $e_i = e + \lambda v_i$ (default), or $e + \lambda v_i / \lVert v_i\rVert$ with `--direction-norm unit`. Each $e_i$ is decoded by Kandinsky into one input image.
+1. **Closeness of every input to the source** (before any generation):
+   $$\text{closeness}_k = \cos\big(f(\texttt{input\_k.jpeg}),\ f(\texttt{recon.jpeg})\big)$$
+   This is an image-level measure. The embedding-level cosine $\cos(e, e_k)$ is not used because it does not separate the inputs: in one folder the three inputs all had $\cos(e, e_k) \approx 0.84$ but image-level similarities of 0.37, 0.76 and 0.47. If `recon.jpeg` is missing, it is decoded from $e$ and saved in the output folder.
+2. **Class**: input $k$ is **close** if $\text{closeness}_k \ge$ `--close-threshold` (0.6), otherwise **far**.
+3. **Target embedding** for main input $k$ (one knob $t$, no per-image levels):
+   $$e_T = (1 - t)\, e + t\, e_k, \qquad \text{rescaled to } \lVert e\rVert$$
+   $t = 0$ is the source embedding, $t = 1$ is input $k$ itself. Moving toward $e_k$ amplifies group $k$ and attenuates the other groups.
+4. **Decoding with Kandinsky 2.2 img2img**: init image = `input_k.jpeg`, condition = $e_T$. The strength $s$ is the diffusers img2img strength, i.e. the fraction of the noise schedule applied to the init image; **larger $s$ = further from the main input**. About 0.4 keeps outline, details and colors; 0.7 keeps the rough layout and proportions; 0.9 almost ignores the init image. The number of denoising steps actually run is `int(steps * s)`. The img2img pipeline reuses the decoder's unet, scheduler and movq, so no extra weights are loaded.
+5. **2 × 2 grid per main, chosen by class** (same seed for every cell):
 
-Expanding step 6:
+   | Class | $t$ | $s$ | Reason |
+   |---|---|---|---|
+   | close | 0, 0.3 | 0.7, 0.9 | $t = 0$ with a large $s$ already gives a target close to the reconstruction |
+   | far | 0.3, 0.6 | 0.4, 0.7 | $t = 0$ has no visible effect at $s \ge 0.7$; a smaller $s$ is needed to keep the main at all |
 
-$$e_i = r + (1+\lambda)\, d_i + \Big(1 - \tfrac{\lambda}{K-1}\Big) \sum_{j \ne i} d_j$$
+6. **Measurements** on re-encoded images (recorded, not used as a filter yet), for target $T$ and main $k$:
+   - `cos_main` $= \cos(f(T), f(\text{input}_k))$; close to 1 = the target is a copy of the main input;
+   - `lift` $= \text{cos\_main} - \text{closeness}_k$: how much more the target resembles the main than the plain reconstruction does; about 0 = the designation had no effect;
+   - `margin` $= \text{cos\_main} - \max_{i \ne k} \cos(f(T), f(\text{input}_i))$; below 0 = the target still resembles another input more than the main.
 
-So $\lambda = K-1$ removes the other clusters exactly, which matches the paper's $\lambda = 1$ for K = 2.
+### How the grids were chosen
+
+`synthesize_v2.py` ran the full 3 × 3 grid ($t \in \{0, 0.3, 0.6\}$, $s \in \{0.4, 0.7, 0.9\}$) on 14 folders (41 mains); the best cell was picked by hand for 7 mains.
+
+- The input closest to the source ("dominant" input) had a closeness of 0.61–0.85, the other inputs 0.26–0.68. The dominant input was the v7.2 keeper in 11 of 14 folders.
+- **Close mains**: hand-picked cells (0, 0.9), (0, 0.9), (0.3, 0.7). Their `lift` was only +0.01 to +0.04, i.e. the target is close to the reconstruction.
+- **Far mains**: hand-picked cells (0.6, 0.7), (0.3, 0.7), (0.6, 0.9), (0.6, 0.4). At $t = 0$, $s \ge 0.7$ the median `lift` was about 0.
+- Hand-picked cells had `cos_main` 0.52–0.78 and `margin` down to −0.15. Using "`cos_main` ≤ 0.8 and `margin` ≥ −0.15" as a criterion, 26 of 27 far mains have at least one usable cell with $s \in \{0.4, 0.7\}$, the same as with the full 3 × 3 grid; with $s \in \{0.7, 0.9\}$ only 21 of 27.
+- The default grids contain 6 of the 7 hand-picked cells; the missing one, (0.6, 0.9), had almost the same values as (0.6, 0.7).
+
+In this analysis the closeness was approximated from `synthesize_v2.py` outputs; `synthesize_v2_1.py` computes it directly, so the threshold may need a small adjustment after the first run.
 
 ### Usage
 
 ```bash
-# one image, K = 2 (top-k auto = 32, cleaning 0.5, lambda 1)
-python decompose.py --image assets/example_decomposition_inputs/cat1.jpeg --output-dir out --k 2
+# default: class-dependent 2 x 2 grid for every input of every folder
+python synthesize_v2_1.py --root hf_generate_source --output-dir output/synth/v2_1
 
-# a folder of images, several K with lambda = K - 1
-python decompose.py --image-dir hf_samples/sources --output-dir hf_decomposed --k 2 --lambda 1
-python decompose.py --image-dir hf_samples/sources --output-dir hf_decomposed --k 3 --lambda 2
-python decompose.py --image-dir hf_samples/sources --output-dir hf_decomposed --k 4 --lambda 3
+# try the first 3 folders only
+python synthesize_v2_1.py --limit 3
+
+# other threshold, or an intermediate strength for far mains
+python synthesize_v2_1.py --close-threshold 0.65
+python synthesize_v2_1.py --far-s 0.4,0.55,0.7
+
+# only inputs 0 and 2 as main subject, with a reference column without init image
+python synthesize_v2_1.py --mains 0,2 --embed-only
+
+# treat every input as far (threshold above 1) or as close (threshold 0)
+python synthesize_v2_1.py --close-threshold 1.1
+python synthesize_v2_1.py --close-threshold 0
 ```
+
+Folders that already contain `synth_meta.json` are skipped unless `--overwrite` is given. At the end, the terminal prints the number of targets, how many mains were close / far, the min / median / max closeness, and in how many folders the dominant input is the keeper.
+
+### Parameters
 
 | Argument | Default | Description |
 |---|---|---|
-| `--image` / `--image-dir` | (one required) | A single image, or a folder of images (`.jpg .jpeg .png .webp .bmp`) |
-| `--output-dir` | `outputs` | Output root |
-| `--k` | `2` | Comma-separated numbers of clusters, e.g. `2,3,4` |
-| `--top-k` | `auto` | `auto` = 16·K (32 / 48 / 64 for K = 2 / 3 / 4), or a comma-separated list |
-| `--clean-clusters-frac` | `0.5` | Comma-separated cleaning fractions; `0` disables cleaning |
-| `--lambda` | `1.0` | Step size along $v_i$ |
-| `--direction-norm` | `none` | `none` (paper scale) or `unit` (normalized direction) |
-| `--save-steps` | off | Also save the half step ($\lambda/2$) for each cluster |
-| `--overwrite` | off | Recompute folders that already contain `meta.json` (otherwise skipped) |
+| `--root` | `hf_generate_source` | Directory with decomposition folders (searched recursively for `embeds.pt` + `input_0.jpeg`), or one such folder |
+| `--output-dir` | `output/synth/v2_1` | Output root; the folder structure under `--root` is kept |
+| `--close-threshold` | 0.6 | An input is close if $\cos(f(\text{input}), f(\text{recon})) \ge$ this value; 0 = every input close, > 1 = every input far |
+| `--close-t` | `0,0.3` | Interpolation weights $t$ for close mains |
+| `--close-s` | `0.7,0.9` | img2img strengths for close mains |
+| `--far-t` | `0.3,0.6` | Interpolation weights $t$ for far mains |
+| `--far-s` | `0.4,0.7` | img2img strengths for far mains |
+| `--mains` | all | Comma-separated input indices to designate as main |
+| `--embed-only` | off | Add a reference column decoded from $e_T$ alone (no init image) |
+| `--seed` | 1 | Kandinsky seed, shared by every cell |
+| `--steps` | 50 | Kandinsky steps; img2img runs `int(steps * s)` of them. Use the value of the decomposition run |
+| `--size` | 768 | Output resolution. Use the value of the decomposition run |
+| `--guidance-scale` | 4.0 | Decoder guidance scale |
+| `--tile` | 256 | Tile size in the overview image |
+| `--limit` | none | Only process the first N folders |
+| `--overwrite` | off | Recompute folders that already contain `synth_meta.json` |
 
-All combinations of K × top-k × cleaning fraction are run. Each image is CLIP/SAE-encoded once and reused for every combination.
-
-### Output
-
-One folder per combination: `{image}_K{K}_topk{top-k}_frac{frac}_lam{lambda}/`
-
-| File | Content |
-|---|---|
-| `input_0.jpeg` … `input_{K-1}.jpeg` | One input image per cluster |
-| `input_i_half.jpeg` | Half step (only with `--save-steps`) |
-| `recon.jpeg` | Kandinsky reconstruction of the unedited embedding $e$ |
-| `embeds.pt` | `e`, `d` (K×1280), `r`, `v`, `e_inputs`, `cluster_labels` |
-| `meta.json` | Parameters; per cluster: kept and dropped feature ids/values, size before and after cleaning, $m_i$, $\lVert d_i\rVert$, $\lVert v_i\rVert$; global: $\lVert e\rVert$, $\lVert r\rVert$, $\lVert r\rVert/\lVert e\rVert$, minimum cluster size after cleaning, silhouette before and after cleaning |
-
-Filtering metrics are **recorded only**; no decomposition is discarded.
-
-### Reproducing the original script
-
-```bash
-python decompose.py --image <img> --output-dir reproduce --k 2 \
-  --top-k 32,64 --clean-clusters-frac 0.5,0.7 --lambda 1 --save-steps
-```
-
-| `decompose_original.py` | `decompose.py` |
-|---|---|
-| `step_-1.jpeg` | `input_0.jpeg` |
-| `step_-0.5.jpeg` | `input_0_half.jpeg` |
-| `step_0.jpeg` | `recon.jpeg` |
-| `step_0.5.jpeg` | `input_1_half.jpeg` |
-| `step_1.jpeg` | `input_1.jpeg` |
-
-Results should match up to half-precision rounding (directions are computed in float32 and cast back).
-
-The original script accepts only one image per call; to run it on a folder:
-
-```bash
-for img in hf_samples/sources/*.jpeg; do
-  python decompose_original.py --image "$img" --output-dir hf_decomposed_original \
-    --top-k 32,64 --clean-clusters-frac 0.5,0.7
-done
-```
-
----
-
-## Weighted target synthesis (`synthesize_target.py`)
-
-### Method
-
-Given one `decompose.py` output folder and one weight per input image (folders from `decompose_v7_2.py` are not supported yet: they store `groups.json` instead of `meta.json` and a different set of contributions):
-
-1. **Weights → proportions**: levels `low` / `medium` / `high` map to center scores 1 / 3 / 9 (or are sampled log-uniformly from center × [0.8, 1.25] with `--sample-scores`); numeric weights are used as given. Scores are normalized to $w$. **$w$ is the label of the sample.**
-2. **Coefficients**: $c_i = w_i / m_i$, clipped to $c_{max}$ (default 3) unless `--allow-exceed`.
-3. **Target embedding**: $e_{target} = s_r\, r + \sum_i c_i d_i$ ($s_r$ = `--residual-scale`, default 1), optionally rescaled to $\lVert e\rVert$ (`--rescale-norm`), decoded once with Kandinsky (seed 1, as in `decompose.py`).
-4. **Measurement and rank check** (default `--measure inputs`): `recon.jpeg`, every `input_i.jpeg` and the target are re-encoded with CLIP (and DINOv2 with `--dino`). All of them went through the same Kandinsky round trip, so they are comparable:
-
-   $$s_i = \cos\big(f(\text{target}) - f(\text{recon}),\ f(\text{input}_i) - f(\text{recon})\big)$$
-
-   i.e. how much the target moved from the reconstruction toward input $i$. For every pair with $w_i / w_j \ge$ `--rank-min-ratio` (default 1.5), the check requires $s_i > s_j$. A sample passes if every such pair is ordered correctly (for every feature extractor used). Patterns with all weights equal have no ordered pairs and are reported as `n/a`.
-
-The rank check is a filter, not a calibration: the absolute values of $s_i$ are not proportions.
-
-### Usage
-
-```bash
-# one folder (weights in input_0, input_1, ... order)
-python synthesize_target.py --folder <decompose output folder> --weights high,low,low,medium
-
-# every decompose output folder under a directory, only K = 2, also measured with DINOv2
-python synthesize_target.py --root hf_decomposed --k 2 --weights high,low --dino
-
-# unweighted target (c = 1): identical to recon.jpeg
-python synthesize_target.py --root hf_decomposed --weights none
-```
-
-| Argument | Default | Description |
-|---|---|---|
-| `--folder` / `--root` | (one required) | One output folder, or all output folders (containing `embeds.pt` and `meta.json`) found under a directory |
-| `--weights` | (required) | `none`, levels (`high,low,low,medium`) or numbers (`0.6,0.2,0.1,0.1`) |
-| `--k` | none | Only process folders with this K (folders whose K differs from the number of weights are skipped anyway) |
-| `--sample-scores`, `--score-seed` | off, 0 | Sample level scores within their intervals |
-| `--c-max`, `--allow-exceed` | 3, off | Coefficient cap and whether to disable clipping |
-| `--rescale-norm`, `--residual-scale` | off, 1 | Target embedding options |
-| `--seed` | 1 | Kandinsky seed |
-| `--measure` | `inputs` | `inputs` (rank check), or the older `projection` / `features` measurements |
-| `--dino` | off | Also measure with DINOv2 (`facebook/dinov2-base`) |
-| `--rank-min-ratio` | 1.5 | Minimum weight ratio for a pair to be rank-checked |
-| `--calibrate`, `--tolerance`, `--max-iters`, `--damping`, `--w-hat-floor` | off, 0.1, 2, 0.5, 0.02 | Optional iterative calibration; only with `--measure projection` or `features` |
-| `--tag`, `--overwrite` | auto, off | Output subfolder name; recompute existing targets |
+The grid lists can have any length (e.g. `--far-s 0.4,0.55,0.7`). Strengths must be in (0, 1] and give at least one denoising step.
 
 ### Output
 
-Results are written next to the inputs, in `<decompose folder>/targets/<tag>/`, where `<tag>` is derived from the weights (`high-low-low-medium`, `high-low-low-medium_s3`, `w0.60-0.20-0.10-0.10`, `none`):
+One folder per decomposition folder: `<output-dir>/<name>/`.
 
 | File | Content |
 |---|---|
-| `target.jpeg` | The target image |
-| `target_iter{n}.jpeg` | Every generated target (only one unless `--calibrate`) |
-| `overview.jpeg` | Inputs labeled with level and $w$, followed by the target labeled with $s$ and PASS/FAIL |
-| `target_meta.json` | Levels, scores, $w$, $m$, requested and used $c$, $s_i$, raw cosine similarities, relative shift from `recon`, per-pair rank results, `rank_passed`, c_max warnings |
+| `overview.jpeg` | First row: recon and all inputs, each with its closeness and class (the keeper is marked with its noun). Then one block per main: one row per $t$ (first cell = the main input with its class), one column per $s$, each cell captioned with `main`, `lift` and `margin` |
+| `main{k}/t{t}_s{s}.jpeg` | Individual targets (`t{t}_noinit.jpeg` with `--embed-only`) |
+| `synth_meta.json` | Threshold and grids; per input: closeness, class, $\cos(e, e_k)$, `cos_to_bias`; dominant input, subject and keeper; per main and cell: $t$, $s$, denoising steps, $\cos(e_T, e)$, $\cos(e_T, e_k)$, `cos_main`, `lift`, `margin`, cosine to every input and to recon, `shift_toward` |
+| `recon.jpeg` | Only if the decomposition folder had none (decoded from $e$) |
 
-With `--root`, a summary `targets_summary_<weights>.json` is written under the root, and the number of folders passing the rank check is printed. Requests that needed $c > c_{max}$ are listed in a warning block at the very end of the run.
+`<output-dir>/summary.json`: one entry per processed folder (closeness and class per input, dominant input, keeper, number of targets).
+
+### How to read the results
+
+- **Copy of the main input**: `cos_main` above about 0.8; most likely at $(t, s) = (0.6, 0.4)$ (26 % of far mains in the 3 × 3 analysis).
+- **Designation without effect**: `lift` about 0, typical for $t = 0$ with a large $s$ on far mains.
+- **Main not dominant**: `margin` clearly below 0; the target still resembles another input more.
+- **Abrupt change between strengths**: some mains are near copies at $s = 0.4$ and lose the main at $s = 0.7$; an intermediate strength (`--far-s 0.4,0.55,0.7`) may help.
+- **Unusable mains**: in one folder, every cell of the 3 × 3 grid resembled another input much more than the main (`margin` −0.28 to −0.39); such mains should be dropped.
+- `cos_to_bias` from the decomposition does **not** reliably identify inputs dominated by the SAE bias (an unrelated animal had 0.36, a clean input of the same folder 0.57).
+
+### Version history
+
+| Script | Change |
+|---|---|
+| `synthesize_target.py` | Per-image levels (`low` / `medium` / `high` = 1 / 3 / 9), $c_i = w_i / m_i$, $e_{target} = r + \sum_i c_i d_i$, rank check; only for `decompose.py` outputs |
+| `synthesize_v2.py` | Designated main subject: $e_T = (1-t)\,e + t\,e_k$ decoded by img2img from the main input; full 3 × 3 grid ($t \in \{0, 0.3, 0.6\}$, $s \in \{0.4, 0.7, 0.9\}$) for every main; reads `decompose_v7_2.py` outputs |
+| **`synthesize_v2_1.py`** | Closeness to the source decides a 2 × 2 grid per main (close / far); `lift` and `margin` replace the averaged shift |
 
 ---
 
@@ -523,29 +506,19 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 
 ### Adaptive decomposition (`decompose_v7_2.py`)
 
-1. **Content removed from every input.** Minor groups, ambiguous (cleaned) features ($eta = 1$) and the weakened subject in non-keeper inputs are subtracted from all inputs; small objects that land there appear in no input. A planned fix is to assign them to exactly one input and to check coverage per noun.
+1. **Content removed from every input.** Minor groups, ambiguous (cleaned) features ($\beta = 1$) and the weakened subject in non-keeper inputs are subtracted from all inputs; small objects that land there appear in no input. A planned fix is to assign them to exactly one input and to check coverage per noun.
 2. **One subject per image.** Only the top-1 noun is handled; multi-object scenes have several subjects, and the retrieved one may be a minor object.
 3. **SAE bias.** Weak groups decode to unrelated animals.
 4. **Retrieval vocabulary.** Subjects outside the built-in list are matched to the nearest listed noun; use `--subject-map` or `--noun-vocab`.
-5. **Not yet connected to target synthesis.** `synthesize_target.py` reads `decompose.py` outputs only.
 
-### Fixed-K baseline (`decompose.py`)
+### Designated-subject synthesis (`synthesize_v2_1.py`)
 
-1. **Shared semantics across inputs.** On semantically dense images, the dominant concept (e.g. a person) appears in most or all input images. This also happens with the original K = 2 script, so it is not specific to the K-way extension. Likely causes:
-   - **Cleaning moves shared concepts into the residual.** Features that relate to several clusters lie near cluster boundaries and are removed by cleaning. Their contribution stays in $r$, and $e_i = e + \lambda v_i$ keeps $r$ at full strength in every input. Increasing λ does not help because these features are not in $v_i$.
-   - **SAE features are not monosemantic.** Composite features (e.g. "glowing human silhouette") spread one concept across several clusters.
-   - **CLIP embeddings are global semantic summaries.** Subject identity is the strongest signal and is hard to remove by linear edits; there is no spatial separation.
-   - **Kandinsky's generative prior.** Decoding is non-linear and threshold-like: a small residual "person" signal is often rendered as a full person.
-   - **Source images with tightly coupled concepts** (everything revolves around one theme) do not contain K independent aspects.
-2. **Uneven cluster sizes.** k-means can produce small clusters; with cleaning 0.5 some clusters end up with only a few features, more often for larger K.
-3. **Clustering uses Euclidean distance on raw decoder directions.** Directions with large norm can dominate. Cosine-based clustering (normalize first) is not implemented yet.
-4. **No filtering yet.** Separation, similarity-to-source and purity filters (Step 3 of the plan) are not implemented; only cluster-level metrics are recorded.
-5. **Reconstruction loss.** Every image passes through Kandinsky 2.2 at 512 px, so even `recon.jpeg` differs from the source. Inputs and future synthesized targets are lower quality than the source images.
-6. **SAE bias.** `model.decode()` adds a constant bias (‖decode(0)‖ ≈ 26), while `model.decoder` (the linear layer) has none. Clustering uses `decode()`, which is unaffected because the bias is shared by all features; contributions $d_i$ use `decoder`, so the bias stays in $r$.
-7. **λ is not yet calibrated** beyond a handful of images.
-8. **Weights are hard to measure in generated images.** The Kandinsky → CLIP round trip has a relative residual of about 0.55, larger than the cluster contributions. Projection-based $\hat w$ is unreliable (see *Current findings*), and iterative calibration is therefore off by default.
-9. **The input-similarity rank check is new and not yet validated.** It only checks ordering, not proportions, and has not yet been compared systematically with human judgment or across CLIP and DINO.
-10. **Labels describe the target embedding, not the target image.** If a weight does not survive the round trip, the prompt level and the image disagree; the rank check is meant to filter such samples.
+1. **Provisional grids and threshold.** The close / far threshold and both 2 × 2 grids come from 7 hand-picked cells on 14 folders.
+2. **Coarse measurements.** `cos_main`, `lift` and `margin` use global CLIP features: they show whether the target moved toward the main, but cannot tell $s = 0.7$ from $s = 0.9$ (shape and layout), so the best cell is still picked visually. No automatic selection or filtering is implemented yet.
+3. **Close mains barely change.** For close mains the selected targets are close to the reconstruction (`lift` +0.01 to +0.04).
+4. **Some mains have no usable cell**, and some change abruptly between $s = 0.4$ (near copy) and $s = 0.7$ (main lost).
+5. **Targets of different mains can look alike** when the inputs of a folder are similar; such input sets do not give useful counterfactual pairs.
+6. **Synthesized targets are Kandinsky images** (768 px) and have a lower quality than the real source images used as targets of unspecified samples.
 
 ---
 
@@ -557,7 +530,7 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 2. **Bias-dominated groups**: detect inputs with a high `cos_to_bias` / weak own group and drop or merge them.
 3. **Several subjects**: handle the top nouns with a sufficient margin, each kept in one input.
 4. **Seed stability** as a filter: decode with 2–3 seeds and keep inputs whose content is stable.
-5. **Target synthesis for v7.2 outputs**: adapt `synthesize_target.py` to `groups.json` / `embeds.pt` of `decompose_v7_2.py`.
+5. **Automatic cell selection for `synthesize_v2_1.py`**: label more mains, then set thresholds on `cos_main`, `lift` and `margin` (and a structural metric such as DINO) to pick one cell per main and drop mains without a usable cell; check per folder that the targets of different mains are distinguishable.
 
 ### Fixed-K baseline (earlier plan)
 
