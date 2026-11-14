@@ -136,3 +136,6 @@ hf_groups*/
 hf_generated/
 probe/
 test_quality/
+
+# Original versions
+original_code/
