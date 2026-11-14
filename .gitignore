@@ -94,6 +94,7 @@ dmypy.json
 # Model checkpoints and outputs
 checkpoints/
 outputs/
+output/
 results/
 logs/
 wandb/

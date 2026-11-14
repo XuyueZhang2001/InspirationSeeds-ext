@@ -1,7 +1,7 @@
 """
 decompose_v5.py -- adaptive SAE feature grouping with coverage expansion and
 input-based group merging.
-Last modified: 2026-11-11
+Last modified: 2026-11-12
 
 What changed in v5 (compared with decompose_v4.py)
 -------------------------------------------------
@@ -11,7 +11,7 @@ What changed in v5 (compared with decompose_v4.py)
         cos(e_i, e_j) >= min(cos(e_i, e), cos(e_j, e)) - merge_margin,
       i.e. the two inputs are more similar to each other than to the source, so they moved
       away from the source in the same direction and would look alike;
-    absolute: merged if cos(e_i, e_j) >= --merge-threshold (default 0.90).
+    absolute: merged if cos(e_i, e_j) >= --merge-threshold (default 0.88).
   The most similar qualifying pair is merged first (union of core, cleaned-out bookkeeping
   and assigned features), the inputs are recomputed, and this repeats until no pair
   qualifies or only --n-min (default 2) groups remain. --n-max still caps the number of
@@ -21,6 +21,20 @@ What changed in v5 (compared with decompose_v4.py)
   Different decoder directions do not imply visibly different inputs, so the number of
   groups is now decided by whether the inputs are actually separated.
   --merge-mode off reproduces v4.
+* Diagnostic images (new, --debug-images, added 2026-11-12). To find out where a concept
+  that appears in every input (e.g. the main subject) is stored, the script additionally
+  decodes, with the same seed:
+    debug_R.jpeg          : R alone, i.e. the part shared by all inputs (everything outside
+                            the main groups: unassigned active features, SAE bias and SAE
+                            reconstruction error; minor/ambiguous features if beta = 0).
+                            If the subject is visible here, it lives in the shared remainder.
+    debug_bias.jpeg       : the SAE decoder bias alone (the "mean image" reference).
+    input_{i}_unique.jpeg : input i without the component that the group contributions
+                            have in common. c = normalize(mean_k D_k / ||D_k||);
+                            s_i = (D_i . c) c;  e_i_unique = e_i - (1 + gamma) s_i.
+                            If the subject disappears here, it is spread across the groups.
+  These are collected in debug_overview.jpeg; groups.json gets a "debug" section with
+  cos(D_i, c), ||s_i|| / ||D_i||, ||R|| / ||e||, cos(R, e) and cos(bias, e).
 * groups.json records every merge (pair, input cosine, cos to source, sizes) and the
   number of main groups before and after merging; the summary prints both distributions.
 
@@ -527,6 +541,42 @@ def process_image(image_path: Path, args, models):
             cells.append((img, f"g{i} n={len(main_clean[i])}/{len(main[i])} +{len(assigned[i])}\nsal={sal(main[i]):.2f}"))
     make_overview(cells, out / "overview.jpeg")
 
+    # diagnostic images
+    debug = None
+    if args.debug_images:
+        R_in = e - sum(D_main, torch.zeros_like(e)) - args.beta_minor * D_minor - args.beta_amb * D_amb
+        b_vec = sae.decode(torch.zeros_like(acts)).float()
+        img_R = generate(R_in.to(e_half.dtype), decoder, negative_emb, args.seed, args.steps, args.size)
+        img_R.save(out / "debug_R.jpeg")
+        img_b = generate(b_vec.to(e_half.dtype), decoder, negative_emb, args.seed, args.steps, args.size)
+        img_b.save(out / "debug_bias.jpeg")
+        dcells = [(source, "source"), (img_R, "R only\n(shared part)"), (img_b, "SAE bias only")]
+        debug = {
+            "norm_R_input_over_e": float(R_in.norm() / e.norm()),
+            "cos_R_input_e": float(torch.nn.functional.cosine_similarity(R_in, e, dim=0)),
+            "cos_bias_e": float(torch.nn.functional.cosine_similarity(b_vec, e, dim=0)),
+            "groups": [],
+        }
+        if decomposable:
+            Dn = torch.nn.functional.normalize(torch.stack(D_main), dim=1)
+            c_dir = torch.nn.functional.normalize(Dn.mean(0), dim=0)
+            for i, ei in enumerate(e_inputs):
+                s_i = (D_main[i] @ c_dir) * c_dir
+                e_u = ei - (1 + args.gamma) * s_i
+                img_u = generate(e_u.to(e_half.dtype), decoder, negative_emb, args.seed, args.steps, args.size)
+                img_u.save(out / f"input_{i}_unique.jpeg")
+                cos_dc = float(torch.nn.functional.cosine_similarity(D_main[i], c_dir, dim=0))
+                share = float(s_i.norm() / D_main[i].norm().clamp_min(1e-8))
+                dcells.append((img_u, f"g{i} unique\ncos(D,c)={cos_dc:.2f}"))
+                debug["groups"].append({"group": i, "cos_D_c": cos_dc, "shared_norm_over_D": share,
+                                        "cos_unique_input_e": float(torch.nn.functional.cosine_similarity(e_u, e, dim=0))})
+            if len(e_inputs) > 1:
+                Du = torch.stack([D_main[i] - (D_main[i] @ c_dir) * c_dir for i in range(len(D_main))])
+                Dun = torch.nn.functional.normalize(Du, dim=1)
+                debug["unique_contribution_cosine"] = (Dun @ Dun.T).tolist()
+                debug["contribution_cosine"] = (Dn @ Dn.T).tolist()
+        make_overview(dcells, out / "debug_overview.jpeg")
+
     # save
     torch.save({
         "e": e.cpu(),
@@ -601,6 +651,7 @@ def process_image(image_path: Path, args, models):
         "norm_R_over_e": float(R.norm() / e.norm()),
         "norm_top_k_over_e": float(D_top.norm() / e.norm()),
         "conditions": cond,
+        "debug": debug,
         "input_embedding_cosine": input_cos,
         "top_features": [{"feature_id": f, "activation": float(a)} for f, a in zip(top, a_top.tolist())],
         "finch_levels": [[[top[j] for j in c] for c in lv] for lv in levels],
@@ -654,7 +705,7 @@ def main():
     p.add_argument("--merge-mode", choices=["relative", "absolute", "off"], default="relative",
                    help="relative: merge two groups if their inputs are more similar to each other than to the source; "
                         "absolute: merge if input cosine >= --merge-threshold; off: no merging (= v4)")
-    p.add_argument("--merge-threshold", type=float, default=0.90, help="Input cosine threshold for --merge-mode absolute")
+    p.add_argument("--merge-threshold", type=float, default=0.88, help="Input cosine threshold for --merge-mode absolute")
     p.add_argument("--merge-margin", type=float, default=0.0,
                    help="Relative mode: merge if cos(e_i, e_j) >= min(cos(e_i, e), cos(e_j, e)) - margin")
     p.add_argument("--n-min", type=int, default=2, help="Merging never goes below this number of main groups")
@@ -668,6 +719,8 @@ def main():
     p.add_argument("--steps", type=int, default=50, help="Kandinsky inference steps (decompose.py uses 18)")
     p.add_argument("--size", type=int, default=768, help="Kandinsky output size (decompose.py uses 512)")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--debug-images", action="store_true",
+                   help="Also decode R alone, the SAE bias alone, and each input without the shared group component")
     args = p.parse_args()
 
     if args.image:
