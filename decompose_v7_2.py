@@ -1,7 +1,7 @@
 """
 decompose_v7_2.py (v7.2) -- adaptive SAE feature grouping with coverage expansion,
 input-based merging and an image-space subject kept in exactly one input.
-Last modified: 2026-11-14
+Last modified: 2026-11-17 (help text of --size; default stays 768)
 
 What changed in v7.2 (compared with decompose_v7_1.py)
 -----------------------------------------------------
@@ -1013,7 +1013,9 @@ def main():
     # generation
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--steps", type=int, default=50, help="Kandinsky inference steps (decompose.py uses 18)")
-    p.add_argument("--size", type=int, default=768, help="Kandinsky output size (decompose.py uses 512)")
+    p.add_argument("--size", type=int, default=768,
+                   help="Kandinsky output size. 768 gives better decompositions than 512; for multi-reference "
+                        "training the inputs are downscaled to --ref-size (512) when they are cached")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--alpha-r", type=float, default=0.7,
                    help="Fraction of the shared part kept in every input (1 = no shared-part scaling)")

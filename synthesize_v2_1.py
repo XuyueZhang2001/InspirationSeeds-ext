@@ -1,6 +1,6 @@
 """
 synthesize_v2_1.py (v2.1) -- designated-subject targets with an automatic 2 x 2 grid per main.
-Last modified: 2026-11-14
+Last modified: 2026-11-17 (default --size 768 -> 1024, the target size of the original Inspiration Seeds)
 
 What changed in v2.1 (compared with synthesize_v2.py)
 ----------------------------------------------------
@@ -75,7 +75,10 @@ Notes
 -----
 * Models and loading are the same as in decompose.py / decompose_v7_2.py; the img2img
   pipeline reuses the decoder's unet, scheduler and movq. The SAE is not needed.
-* Use the same --size / --steps as the decomposition run (decompose_v7_2.py: 768 / 50).
+* Resolution: targets are generated at --size (1024 by default, like the real source images
+  that serve as targets of unspecified samples). The decomposed inputs are 768 px
+  (decompose_v7_2.py --size 768); they are upsampled to --size only to serve as img2img
+  init images. recon.jpeg is used only through CLIP, so its resolution does not matter.
 """
 
 import argparse
@@ -419,7 +422,9 @@ def main():
                    help="Add a reference column decoded from e_T alone (no init image)")
     p.add_argument("--seed", type=int, default=1, help="Kandinsky seed, shared by every cell")
     p.add_argument("--steps", type=int, default=50, help="Kandinsky steps (actual img2img steps = int(steps * strength))")
-    p.add_argument("--size", type=int, default=768, help="Output resolution (decompose_v7_2.py uses 768)")
+    p.add_argument("--size", type=int, default=1024,
+                   help="Target resolution (1024 = size of the real source images; inputs are upsampled to it "
+                        "as img2img init images)")
     p.add_argument("--guidance-scale", type=float, default=4.0, help="Decoder guidance scale (pipeline default 4.0)")
     p.add_argument("--tile", type=int, default=256, help="Tile size in the overview image")
     p.add_argument("--limit", type=int, default=None, help="Only process the first LIMIT folders")

@@ -1,0 +1,251 @@
+"""Multi-reference conditioning for FLUX.1 Kontext (diffusers 0.43).
+
+Reference images
+    Each reference is encoded separately by the VAE (ref_size x ref_size, default 512 ->
+    64 x 64 latent -> 32 x 32 = 1024 tokens). The token groups are concatenated, in model
+    order, after the tokens of the image being generated. Every group is contiguous, so the
+    tokens of reference k are a fixed slice of the sequence.
+
+Position ids (t, h, w) of the reference tokens; the generated image always has t = 0
+    canvas  t = 1 for every reference, groups side by side along w ("virtual canvas").
+            Same ids as concatenating the latents along the width and passing them to the
+            stock pipeline as one reference; only the token order differs (the stock
+            packing interleaves the references row by row, which would break the
+            contiguous slices needed by the role embedding).
+    per_t   reference k gets t = k + 1; h and w are scaled so that every reference spans
+            the whole token grid of the generated image (ablation).
+
+Main image (role mode "embed")
+    MainRoleEmbedding adds a learnable vector E_main to every token of the main reference
+    right after the patch embedding, through a forward hook on transformer.x_embedder.
+    E_main starts at zero, so the model is unchanged before training. The slice is
+    counted from the END of the image sequence (references come last), so it does not
+    depend on the output resolution.
+
+Pipeline
+    MultiRefKontextPipeline is FluxKontextPipeline with prepare_latents overridden: when
+    references are injected, it returns them as the image tokens instead of encoding the
+    `image` argument. Everything else (scheduler, denoising loop, LoRA loading) is the
+    stock pipeline.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+from diffusers import FluxKontextPipeline
+from PIL import Image
+from safetensors.torch import load_file, save_file
+
+from .prompts import ROLE_MODES, arrange
+
+LAYOUTS = ("canvas", "per_t")
+
+
+# --------------------------------------------------------------------------------------
+# Images and latents
+# --------------------------------------------------------------------------------------
+def load_rgb(path) -> Image.Image:
+    return Image.open(path).convert("RGB")
+
+
+def center_crop_square(image: Image.Image) -> Image.Image:
+    w, h = image.size
+    if w == h:
+        return image
+    s = min(w, h)
+    left, top = (w - s) // 2, (h - s) // 2
+    return image.crop((left, top, left + s, top + s))
+
+
+@torch.no_grad()
+def encode_image(vae, image_processor, image: Image.Image, size: int, device, dtype) -> torch.Tensor:
+    """VAE latent of one image at size x size, normalized as in FluxKontextPipeline._encode_vae_image.
+
+    The image is center-cropped to a square, resized with the pipeline's image processor and
+    encoded with the mode of the latent distribution (same as the pipeline's "argmax").
+    Returns [1, 16, size / 8, size / 8].
+    """
+    image = center_crop_square(image.convert("RGB"))
+    image = image_processor.resize(image, size, size)
+    pixels = image_processor.preprocess(image, size, size).to(device=device, dtype=dtype)
+    latents = vae.encode(pixels).latent_dist.mode()
+    return (latents - vae.config.shift_factor) * vae.config.scaling_factor
+
+
+def pack_latents(latents: torch.Tensor) -> torch.Tensor:
+    """[B, C, H, W] -> [B, (H/2) * (W/2), 4C], the Flux 2 x 2 patch packing."""
+    b, c, h, w = latents.shape
+    return FluxKontextPipeline._pack_latents(latents, b, c, h, w)
+
+
+def make_ids(h2: int, w2: int, t: float, h_off: float = 0.0, w_off: float = 0.0,
+             scale_h: float = 1.0, scale_w: float = 1.0) -> torch.Tensor:
+    """(t, h, w) ids of an h2 x w2 token grid, row-major like _prepare_latent_image_ids. Returns [h2 * w2, 3]."""
+    ids = torch.zeros(h2, w2, 3)
+    ids[..., 0] = t
+    ids[..., 1] = torch.arange(h2)[:, None] * scale_h + h_off
+    ids[..., 2] = torch.arange(w2)[None, :] * scale_w + w_off
+    return ids.reshape(h2 * w2, 3)
+
+
+def build_reference_tokens(latents_list, layout: str = "canvas", target_hw=None):
+    """Packed tokens, ids and token slices of the references (in model order).
+
+    latents_list: list of [B, 16, h, w] latents (same B)
+    layout:       "canvas" or "per_t"
+    target_hw:    (h2, w2) token grid of the generated image, required for "per_t"
+
+    Returns (tokens [B, L, 64], ids [L, 3], spans) where spans[k] = (start, end) is the
+    slice of reference k inside the reference block (0 = first reference token).
+    """
+    if layout not in LAYOUTS:
+        raise ValueError(f"Unknown layout {layout!r}; expected one of {LAYOUTS}")
+    if layout == "per_t" and target_hw is None:
+        raise ValueError("layout 'per_t' needs target_hw")
+    tokens, ids, spans = [], [], []
+    start, w_offset = 0, 0
+    for k, lat in enumerate(latents_list):
+        _, _, h, w = lat.shape
+        h2, w2 = h // 2, w // 2
+        tok = pack_latents(lat)
+        if layout == "canvas":
+            i = make_ids(h2, w2, t=1, w_off=w_offset)
+            w_offset += w2
+        else:
+            th, tw = target_hw
+            i = make_ids(h2, w2, t=k + 1, scale_h=th / h2, scale_w=tw / w2)
+        tokens.append(tok)
+        ids.append(i)
+        spans.append((start, start + tok.shape[1]))
+        start += tok.shape[1]
+    return torch.cat(tokens, dim=1), torch.cat(ids, dim=0), spans
+
+
+# --------------------------------------------------------------------------------------
+# Main-image role embedding
+# --------------------------------------------------------------------------------------
+class MainRoleEmbedding(nn.Module):
+    """Learnable vector added to the tokens of the main reference after transformer.x_embedder.
+
+    Usage:
+        role = MainRoleEmbedding(transformer.inner_dim).to(device).attach(transformer)
+        role.set_main(spans, main_pos)   # before each forward; main_pos None = no main image
+        ...
+        role.clear()
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.e_main = nn.Parameter(torch.zeros(dim))  # zero init: no effect before training
+        self._span = None  # (start, end, total) inside the reference block
+        self._handle = None
+
+    def attach(self, transformer):
+        self.detach()
+        self._handle = transformer.x_embedder.register_forward_hook(self._hook)
+        return self
+
+    def detach(self):
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
+
+    def set_main(self, spans, main_pos):
+        """spans from build_reference_tokens; main_pos = position of the main reference in model order."""
+        if main_pos is None:
+            self._span = None
+            return
+        start, end = spans[main_pos]
+        self._span = (start, end, spans[-1][1])
+
+    def clear(self):
+        self._span = None
+
+    def _hook(self, module, inputs, output):
+        # output: [B, target tokens + reference tokens, D]; references are the last `total` tokens
+        if self._span is None:
+            return output
+        start, end, total = self._span
+        ref0 = output.shape[1] - total
+        if ref0 < 0:
+            raise RuntimeError(f"Sequence of length {output.shape[1]} is shorter than the reference block ({total}).")
+        e = self.e_main.to(device=output.device, dtype=output.dtype)
+        a, b = ref0 + start, ref0 + end
+        # out-of-place, so gradients reach both the transformer input and E_main
+        return torch.cat([output[:, :a], output[:, a:b] + e, output[:, b:]], dim=1)
+
+    def save(self, path):
+        save_file({"e_main": self.e_main.detach().float().cpu().contiguous()}, str(path))
+
+    def load(self, path):
+        state = load_file(str(path))
+        with torch.no_grad():
+            self.e_main.copy_(state["e_main"].to(self.e_main.device, self.e_main.dtype))
+        return self
+
+
+# --------------------------------------------------------------------------------------
+# Pipeline
+# --------------------------------------------------------------------------------------
+class MultiRefKontextPipeline(FluxKontextPipeline):
+    """FluxKontextPipeline that accepts several reference images (see generate_multi)."""
+
+    _multiref = None  # (tokens [B, L, 64], ids [L, 3]) injected for the next call
+
+    def prepare_latents(self, image, batch_size, num_channels_latents, height, width, dtype, device,
+                        generator=None, latents=None):
+        if self._multiref is None:
+            return super().prepare_latents(image, batch_size, num_channels_latents, height, width, dtype, device,
+                                           generator, latents)
+        # noise and ids of the image being generated, exactly as in the stock pipeline
+        latents, _, latent_ids, _ = super().prepare_latents(None, batch_size, num_channels_latents, height, width,
+                                                            dtype, device, generator, latents)
+        tokens, ids = self._multiref
+        image_latents = tokens.to(device=device, dtype=dtype)
+        if image_latents.shape[0] != batch_size:
+            if batch_size % image_latents.shape[0] != 0:
+                raise ValueError(f"Cannot expand {image_latents.shape[0]} reference sets to batch size {batch_size}.")
+            image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1)
+        return latents, image_latents, latent_ids, ids.to(device=device, dtype=dtype)
+
+    @torch.no_grad()
+    def encode_references(self, images, ref_size: int = 512):
+        """VAE latents of the references, each [1, 16, ref_size / 8, ref_size / 8]."""
+        device = self._execution_device
+        return [encode_image(self.vae, self.image_processor, im, ref_size, device, self.vae.dtype) for im in images]
+
+    @torch.no_grad()
+    def generate_multi(self, references, main=None, role_mode: str = "embed", layout: str = "canvas",
+                       role_embedding: MainRoleEmbedding | None = None, ref_size: int = 512,
+                       height: int = 1024, width: int = 1024, prompt: str | None = None, **kwargs):
+        """Generate from 2-4 reference images.
+
+        references:     list of PIL images, in the user's order
+        main:           index of the main image in that order (0-based), or None
+        role_mode:      "embed" (E_main on the main image), "slot" (main moved first), "index" (named in prompt)
+        role_embedding: MainRoleEmbedding attached to self.transformer (used with role_mode "embed")
+        prompt:         override the template prompt (normally left None)
+        kwargs:         passed to the pipeline (num_inference_steps, guidance_scale, generator, ...)
+
+        Returns (pipeline output, info) with info = {order, main_pos, prompt}.
+        """
+        if role_mode not in ROLE_MODES:
+            raise ValueError(f"Unknown role mode {role_mode!r}; expected one of {ROLE_MODES}")
+        order, main_pos, template = arrange(len(references), main, role_mode, shuffle=False)
+        latents = self.encode_references([references[i] for i in order], ref_size)
+        multiple = self.vae_scale_factor * 2
+        target_hw = (height // multiple, width // multiple)
+        tokens, ids, spans = build_reference_tokens(latents, layout, target_hw)
+        if role_embedding is not None:
+            role_embedding.set_main(spans, main_pos if role_mode == "embed" else None)
+        self._multiref = (tokens, ids)
+        prompt = prompt or template
+        try:
+            # max_area must match height * width: the pipeline rescales the output to max_area
+            out = self(prompt=prompt, height=height, width=width, max_area=height * width, **kwargs)
+        finally:
+            self._multiref = None
+            if role_embedding is not None:
+                role_embedding.clear()
+        return out, {"order": order, "main_pos": main_pos, "prompt": prompt}
