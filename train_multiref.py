@@ -1,0 +1,542 @@
+"""
+train_multiref.py -- LoRA (+ main-image role embedding) fine-tuning of FLUX.1 Kontext dev with 2-4 references.
+Last modified: 2026-11-17
+
+Data: manifests from build_dataset.py (train.jsonl, val.jsonl) and the cache from
+cache_features.py (VAE latents + prompt embeddings). Only the transformer (and, for the sample
+images, the VAE) is loaded; no text encoder is needed.
+
+One training step (batch 1, --grad-accum micro steps per optimizer step), following the
+diffusers example train_dreambooth_lora_flux_kontext.py where possible:
+    1. pool:   unspecified with probability --unspec-schedule(progress), else designated
+    2. sample: unspecified -> uniform folder; designated -> uniform folder, main, kept target
+    3. order:  references shuffled (multiref.prompts.arrange); prompt template of the main
+               position; cached latents (references [16, 64, 64], target [16, 128, 128])
+    4. noise:  sigma from the scheduler's training table (--weighting-scheme: uniform or
+               logit_normal), x_t = (1 - sigma) x_0 + sigma * noise, packed target tokens (t = 0)
+    5. refs:   reference tokens and ids (multiref.conditioning.build_reference_tokens) appended
+               after the target tokens; E_main hook set on the main reference (--role embed)
+    6. loss:   transformer(timestep = sigma, guidance = --guidance-scale); MSE between the
+               output of the target tokens and (noise - x_0)
+
+Trainable parameters: LoRA on the attention / feed-forward layers INSIDE the transformer
+blocks (the final output projection, also named proj_out, is excluded) and E_main.
+LoRA parameters are kept in float32, the forward pass runs in bfloat16 autocast.
+
+Validation
+    * every --val-every steps: loss on a fixed set of validation samples (fixed order, target,
+      noise and sigmas 0.25 / 0.5 / 0.75), separately for the two pools
+    * every --image-every steps (and at step 0): sample images for a few validation folders,
+      preferably with >= 2 designated mains: no main, then each main, next to the targets
+      -> <output-dir>/samples/step_XXXXXX.jpeg
+
+Checkpoints (every --save-every steps and at the end): <output-dir>/checkpoint-XXXXXX/
+    lora/                      diffusers LoRA format (generate_multi.py --lora)
+    role_embedding.safetensors E_main (generate_multi.py --role-embedding)
+    train_state.pt             optimizer, scheduler, step and RNG states (--resume)
+
+Overfitting test
+    --overfit N trains on a fixed subset of about N training samples (whole designated folders
+    with their counterfactual mains, plus unspecified samples), one target per main, and uses
+    the same subset for validation. The loss should drop far below its start value and the
+    sample images should approach the targets.
+
+Usage
+-----
+    # overfitting test
+    python train_multiref.py --data-dir data/multiref --output-dir runs/overfit \\
+        --overfit 8 --max-steps 1500 --warmup-steps 50 --grad-accum 1 \\
+        --val-every 100 --image-every 250 --save-every 500
+
+    # full run
+    python train_multiref.py --data-dir data/multiref --output-dir runs/v1 --max-steps 10000
+"""
+
+import argparse
+import json
+import random
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import torch
+from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, FluxKontextPipeline, FluxTransformer2DModel
+from diffusers.training_utils import (
+    cast_training_params,
+    compute_density_for_timestep_sampling,
+    compute_loss_weighting_for_sd3,
+)
+from diffusers.utils import convert_unet_state_dict_to_peft
+from peft import LoraConfig, set_peft_model_state_dict
+from peft.utils import get_peft_model_state_dict
+from PIL import Image, ImageDraw, ImageFont
+
+from multiref.conditioning import LAYOUTS, MainRoleEmbedding, MultiRefKontextPipeline, build_reference_tokens, pack_latents
+from multiref.prompts import ROLE_MODES, arrange, prompt_key
+from multiref.train_data import (
+    LatentStore,
+    PoolSampler,
+    PoolSchedule,
+    all_latent_paths,
+    load_rows,
+    make_example,
+    pick_overfit_rows,
+)
+
+DEVICE = "cuda"
+DTYPE = torch.bfloat16
+DEFAULT_SCHEDULE = "0:1.0,0.3:1.0,0.4:0.65"
+OVERFIT_SCHEDULE = "0.5"
+# LoRA layers (suffixes of module names inside transformer_blocks / single_transformer_blocks)
+LORA_SUFFIXES = (
+    "attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",                        # image stream attention
+    "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj", "attn.to_add_out",    # text stream attention
+    "ff.net.0.proj", "ff.net.2", "ff_context.net.0.proj", "ff_context.net.2",      # double-block feed-forward
+    "proj_mlp", "proj_out",                                                        # single-block MLP / output
+)
+
+
+# --------------------------------------------------------------------------------------
+# Arguments
+# --------------------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Multi-reference LoRA fine-tuning of FLUX.1 Kontext")
+    g = p.add_argument_group("data")
+    g.add_argument("--data-dir", type=Path, default=Path("data/multiref"), help="train.jsonl / val.jsonl")
+    g.add_argument("--cache-dir", type=Path, default=None, help="Default: <data-dir>/cache")
+    g.add_argument("--output-dir", type=Path, default=Path("runs/multiref"))
+    g.add_argument("--unspec-schedule", default=None,
+                   help=f"Probability of the unspecified pool over training progress (default {DEFAULT_SCHEDULE}; "
+                        f"with --overfit {OVERFIT_SCHEDULE})")
+    g.add_argument("--overfit", type=int, default=0, help="Overfitting test on about N fixed training samples")
+    g.add_argument("--no-shuffle", action="store_true", help="Keep the input order fixed (debugging)")
+    g.add_argument("--preload", action="store_true", help="Keep all cached latents in memory")
+
+    g = p.add_argument_group("model")
+    g.add_argument("--base-model", default="black-forest-labs/FLUX.1-Kontext-dev")
+    g.add_argument("--role", choices=ROLE_MODES, default="embed", help="How the main image is designated")
+    g.add_argument("--layout", choices=LAYOUTS, default="canvas", help="Position ids of the references")
+    g.add_argument("--lora-rank", type=int, default=32)
+    g.add_argument("--lora-alpha", type=int, default=None, help="Default: equal to the rank")
+    g.add_argument("--lora-layers", default=",".join(LORA_SUFFIXES),
+                   help="Comma-separated module-name suffixes inside the transformer blocks")
+    g.add_argument("--init-lora", default=None, help="Initialize the LoRA from these weights (same rank and layers)")
+    g.add_argument("--guidance-scale", type=float, default=3.5, help="Guidance embedding value (use it at inference)")
+
+    g = p.add_argument_group("optimization")
+    g.add_argument("--max-steps", type=int, default=10000, help="Optimizer steps")
+    g.add_argument("--grad-accum", type=int, default=4, help="Micro steps (samples) per optimizer step")
+    g.add_argument("--lr", type=float, default=1e-4, help="LoRA learning rate")
+    g.add_argument("--role-lr", type=float, default=1e-3, help="E_main learning rate")
+    g.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay of the LoRA parameters")
+    g.add_argument("--warmup-steps", type=int, default=500, help="Linear warmup, then constant")
+    g.add_argument("--max-grad-norm", type=float, default=1.0)
+    g.add_argument("--weighting-scheme", choices=["none", "logit_normal", "mode", "cosmap", "sigma_sqrt"],
+                   default="none", help="Timestep density / loss weighting (none = uniform sigma)")
+    g.add_argument("--logit-mean", type=float, default=0.0)
+    g.add_argument("--logit-std", type=float, default=1.0)
+    g.add_argument("--mode-scale", type=float, default=1.29)
+    g.add_argument("--seed", type=int, default=0)
+
+    g = p.add_argument_group("validation and checkpoints")
+    g.add_argument("--log-every", type=int, default=10)
+    g.add_argument("--val-every", type=int, default=500, help="Validation loss interval (0 = off)")
+    g.add_argument("--val-samples", type=int, default=16, help="Validation samples used for the loss")
+    g.add_argument("--image-every", type=int, default=1000, help="Sample-image interval (0 = off)")
+    g.add_argument("--image-folders", type=int, default=3, help="Validation folders shown in the sample images")
+    g.add_argument("--image-steps", type=int, default=28, help="Denoising steps of the sample images")
+    g.add_argument("--no-images-at-start", action="store_true", help="Skip the sample images at step 0")
+    g.add_argument("--save-every", type=int, default=1000)
+    g.add_argument("--resume", type=Path, default=None, help="checkpoint-XXXXXX folder to resume from")
+    g.add_argument("--tensorboard", action="store_true", help="Also log to TensorBoard (<output-dir>/tb)")
+    return p.parse_args()
+
+
+# --------------------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------------------
+def lora_target_names(transformer, suffixes):
+    """Full names of the Linear layers inside the transformer blocks that end with one of the suffixes."""
+    names = []
+    for name, module in transformer.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if not (name.startswith("transformer_blocks.") or name.startswith("single_transformer_blocks.")):
+            continue
+        if any(name == s or name.endswith("." + s) for s in suffixes):
+            names.append(name)
+    if not names:
+        raise ValueError(f"No LoRA target layers found for suffixes {suffixes}")
+    return names
+
+
+def build_transformer(args):
+    transformer = FluxTransformer2DModel.from_pretrained(args.base_model, subfolder="transformer", torch_dtype=DTYPE)
+    transformer.requires_grad_(False)
+    transformer.enable_gradient_checkpointing()
+    targets = lora_target_names(transformer, [s.strip() for s in args.lora_layers.split(",") if s.strip()])
+    config = LoraConfig(r=args.lora_rank, lora_alpha=args.lora_alpha or args.lora_rank,
+                        init_lora_weights="gaussian", target_modules=targets)
+    transformer.add_adapter(config)
+    transformer.to(DEVICE)
+    cast_training_params(transformer, dtype=torch.float32)  # LoRA weights in float32
+    if args.init_lora:
+        load_lora_into(transformer, args.init_lora)
+    n_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+    print(f"LoRA: rank {args.lora_rank}, {len(targets)} layers, {n_params / 1e6:.1f} M trainable parameters")
+    return transformer
+
+
+def load_lora_into(transformer, path):
+    """Load diffusers-format LoRA weights into the existing adapter (warm start)."""
+    state = FluxKontextPipeline.lora_state_dict(path)
+    state = {k[len("transformer."):]: v for k, v in state.items() if k.startswith("transformer.")}
+    state = convert_unet_state_dict_to_peft(state)
+    result = set_peft_model_state_dict(transformer, state, adapter_name="default")
+    unexpected = getattr(result, "unexpected_keys", None) or []
+    print(f"init LoRA {path}: {len(state)} tensors, {len(unexpected)} unexpected keys")
+
+
+def sigma_table(args):
+    """Training sigmas of the scheduler (same table as the diffusers example), descending."""
+    sched = FlowMatchEulerDiscreteScheduler.from_pretrained(args.base_model, subfolder="scheduler")
+    return sched.sigmas.clone().float()
+
+
+def sample_sigma(args, sigmas, generator):
+    u = compute_density_for_timestep_sampling(weighting_scheme=args.weighting_scheme, batch_size=1,
+                                              logit_mean=args.logit_mean, logit_std=args.logit_std,
+                                              mode_scale=args.mode_scale, generator=generator)
+    idx = (u * len(sigmas)).long().clamp(0, len(sigmas) - 1)
+    return sigmas[idx]
+
+
+# --------------------------------------------------------------------------------------
+# Forward / loss
+# --------------------------------------------------------------------------------------
+def forward_loss(transformer, role, ex, sigma, noise, args):
+    """Flow-matching loss of one example. sigma: [1] tensor; noise: like the target latent or None."""
+    x0 = ex["target"].unsqueeze(0).to(DEVICE, DTYPE)                      # [1, 16, H, W]
+    _, _, h, w = x0.shape
+    if noise is None:
+        noise = torch.randn_like(x0)
+    noise = noise.to(DEVICE, DTYPE)
+    s = sigma.to(DEVICE, torch.float32)
+    xt = ((1.0 - s.view(1, 1, 1, 1)) * x0.float() + s.view(1, 1, 1, 1) * noise.float()).to(DTYPE)
+
+    tgt_tokens = pack_latents(xt)
+    tgt_ids = FluxKontextPipeline._prepare_latent_image_ids(1, h // 2, w // 2, DEVICE, DTYPE)
+    refs = [r.unsqueeze(0).to(DEVICE, DTYPE) for r in ex["refs"]]
+    ref_tokens, ref_ids, spans = build_reference_tokens(refs, args.layout, (h // 2, w // 2))
+    hidden = torch.cat([tgt_tokens, ref_tokens.to(DEVICE, DTYPE)], dim=1)
+    img_ids = torch.cat([tgt_ids, ref_ids.to(DEVICE, DTYPE)], dim=0)
+
+    pr = ex["prompt"]
+    if role is not None:
+        role.set_main(spans, ex["main_pos"])
+    try:
+        with torch.autocast("cuda", dtype=DTYPE):
+            pred = transformer(
+                hidden_states=hidden,
+                encoder_hidden_states=pr["prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
+                pooled_projections=pr["pooled_prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
+                timestep=s,                                    # the transformer multiplies by 1000
+                img_ids=img_ids,
+                txt_ids=pr["text_ids"].to(DEVICE, DTYPE),
+                guidance=torch.full((1,), args.guidance_scale, device=DEVICE),
+                return_dict=False,
+            )[0]
+    finally:
+        if role is not None:
+            role.clear()
+    pred = pred[:, : tgt_tokens.shape[1]].float()
+    target = pack_latents((noise.float() - x0.float()))       # packing is a permutation of the latent
+    weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, sigmas=s).view(1, 1, 1).float()
+    return (weighting * (pred - target) ** 2).mean()
+
+
+# --------------------------------------------------------------------------------------
+# Validation
+# --------------------------------------------------------------------------------------
+def fixed_val_set(rows, store, args):
+    """Fixed validation examples: order, target, noise and sigmas do not change between evaluations."""
+    rows = sorted(rows, key=lambda r: r["id"])
+    rng = random.Random(1234)
+    rng.shuffle(rows)
+    out = []
+    for i, row in enumerate(rows[: args.val_samples]):
+        ex = make_example(row, row["targets"][0], store, args.role, random.Random(i), shuffle=not args.no_shuffle)
+        gen = torch.Generator().manual_seed(10_000 + i)
+        noises = [torch.randn(ex["target"].unsqueeze(0).shape, generator=gen) for _ in range(3)]
+        out.append((ex, noises))
+    return out
+
+
+@torch.no_grad()
+def validation_loss(transformer, role, val_set, args):
+    transformer.eval()
+    losses = defaultdict(list)
+    for ex, noises in val_set:
+        for sig, noise in zip((0.25, 0.5, 0.75), noises):
+            loss = forward_loss(transformer, role, ex, torch.tensor([sig]), noise, args)
+            losses[ex["pool"]].append(loss.item())
+    transformer.train()
+    out = {f"val_loss_{k}": sum(v) / len(v) for k, v in losses.items()}
+    all_losses = [x for v in losses.values() for x in v]
+    out["val_loss"] = sum(all_losses) / max(1, len(all_losses))
+    return out
+
+
+def image_folders(rows, n):
+    """Validation folders for the sample images: most designated mains first."""
+    by_folder = defaultdict(list)
+    for r in rows:
+        by_folder[r["folder"]].append(r)
+    ranked = sorted(by_folder, key=lambda f: (-sum(r["pool"] == "designated" for r in by_folder[f]), f))
+    out = []
+    for f in ranked[:n]:
+        rs = by_folder[f]
+        out.append(sorted(rs, key=lambda r: (-1 if r["main"] is None else r["main"])))
+    return out
+
+
+@torch.no_grad()
+def sample_images(pipe, role, folders, store, args, step):
+    pipe.transformer.eval()
+    size = store.target_size
+    blocks = []
+    for rows in folders:
+        inputs = [Image.open(p).convert("RGB") for p in rows[0]["inputs"]]
+        results = []
+        for row in rows:
+            order, main_pos, _ = arrange(len(row["inputs"]), row["main"], args.role, shuffle=False)
+            refs = [store.ref(row["inputs"][i]).unsqueeze(0).to(DEVICE, DTYPE) for i in order]
+            pr = store.prompt(prompt_key(main_pos, args.role))
+            with torch.autocast("cuda", dtype=DTYPE):
+                out = pipe.generate_from_latents(
+                    refs, main_pos, args.role, args.layout, role, height=size, width=size,
+                    prompt_embeds=pr["prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
+                    pooled_prompt_embeds=pr["pooled_prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
+                    num_inference_steps=args.image_steps, guidance_scale=args.guidance_scale,
+                    generator=torch.Generator(device=DEVICE).manual_seed(args.seed))
+            label = "no main" if row["main"] is None else f"main = input_{row['main']}"
+            results.append((label, out.images[0], Image.open(row["targets"][0]).convert("RGB")))
+        blocks.append((Path(rows[0]["folder"]).name, inputs, results))
+    pipe.transformer.train()
+    path = args.output_dir / "samples" / f"step_{step:06d}.jpeg"
+    save_sample_grid(blocks, path, step)
+    return path
+
+
+def save_sample_grid(blocks, path, step, tile=256):
+    """Per folder: inputs | generated (one per condition) | targets (same columns)."""
+    try:
+        font = ImageFont.load_default(size=14)
+    except TypeError:  # older Pillow
+        font = ImageFont.load_default()
+    gap, cap, head = 8, 20, 24
+    n_cols = max(max(len(inp), len(res)) for _, inp, res in blocks)
+    W = gap + n_cols * (tile + gap)
+    block_h = head + 3 * (tile + cap + gap)
+    canvas = Image.new("RGB", (W, 30 + len(blocks) * block_h), "white")
+    draw = ImageDraw.Draw(canvas)
+    draw.text((gap, 6), f"step {step}: row 1 inputs, row 2 generated, row 3 targets", fill="black", font=font)
+    y0 = 30
+    for name, inputs, results in blocks:
+        draw.text((gap, y0 + 4), name, fill="black", font=font)
+        rows = [[(im, f"input_{i}") for i, im in enumerate(inputs)],
+                [(gen, label) for label, gen, _ in results],
+                [(tgt, "target") for _, _, tgt in results]]
+        for r, cells in enumerate(rows):
+            y = y0 + head + r * (tile + cap + gap)
+            for c, (im, text) in enumerate(cells):
+                x = gap + c * (tile + gap)
+                canvas.paste(im.resize((tile, tile)), (x, y))
+                draw.text((x + 2, y + tile + 2), text, fill="black", font=font)
+        y0 += block_h
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path, quality=90)
+
+
+# --------------------------------------------------------------------------------------
+# Checkpoints
+# --------------------------------------------------------------------------------------
+def save_checkpoint(out_dir: Path, transformer, role, optimizer, lr_sched, step, sampler, data_rng, args):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lora_state = get_peft_model_state_dict(transformer)
+    FluxKontextPipeline.save_lora_weights(
+        out_dir / "lora",
+        transformer_lora_layers={k: v.detach().to(DTYPE).cpu() for k, v in lora_state.items()},
+        transformer_lora_adapter_metadata=transformer.peft_config["default"].to_dict(),
+    )
+    if role is not None:
+        role.save(out_dir / "role_embedding.safetensors")
+    torch.save({
+        "step": step,
+        "lora": {k: v.detach().cpu() for k, v in lora_state.items()},
+        "e_main": role.e_main.detach().cpu() if role is not None else None,
+        "optimizer": optimizer.state_dict(),
+        "lr_scheduler": lr_sched.state_dict(),
+        "sampler_rng": sampler.rng.getstate(),
+        "data_rng": data_rng.getstate(),
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state(),
+        "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+    }, out_dir / "train_state.pt")
+    print(f"saved {out_dir}")
+
+
+def load_checkpoint(path: Path, transformer, role, optimizer, lr_sched, sampler, data_rng):
+    state = torch.load(path / "train_state.pt", map_location="cpu", weights_only=False)
+    set_peft_model_state_dict(transformer, state["lora"], adapter_name="default")
+    cast_training_params(transformer, dtype=torch.float32)
+    if role is not None and state["e_main"] is not None:
+        with torch.no_grad():
+            role.e_main.copy_(state["e_main"].to(role.e_main.device))
+    optimizer.load_state_dict(state["optimizer"])
+    lr_sched.load_state_dict(state["lr_scheduler"])
+    sampler.rng.setstate(state["sampler_rng"])
+    data_rng.setstate(state["data_rng"])
+    torch.set_rng_state(state["torch_rng"])
+    torch.cuda.set_rng_state(state["cuda_rng"])
+    print(f"resumed from {path} at step {state['step']}")
+    return state["step"]
+
+
+# --------------------------------------------------------------------------------------
+def main():
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = args.cache_dir or args.data_dir / "cache"
+
+    # ---------------- data ----------------
+    train_rows = load_rows(args.data_dir, "train")
+    val_rows = load_rows(args.data_dir, "val")
+    if args.overfit:
+        train_rows = pick_overfit_rows(train_rows, args.overfit, seed=args.seed)
+        val_rows = train_rows
+        print("overfitting test on: " + ", ".join(r["id"] for r in train_rows))
+    if not train_rows:
+        raise ValueError(f"No training samples in {args.data_dir}")
+    if not val_rows:
+        print("[warn] no validation samples: using training samples for validation")
+        val_rows = train_rows
+    schedule = PoolSchedule(args.unspec_schedule or (OVERFIT_SCHEDULE if args.overfit else DEFAULT_SCHEDULE))
+
+    store = LatentStore(cache_dir)
+    if store.config.get("base_model") != args.base_model:
+        print(f"[warn] cache built with {store.config.get('base_model')}, training {args.base_model}")
+    if args.preload:
+        store = LatentStore(cache_dir, all_latent_paths(train_rows + val_rows, store.ref_size, store.target_size))
+    for main_pos in [None] + list(range(4)):
+        if args.role != "index" and main_pos not in (None, 0):
+            continue
+        store.prompt(prompt_key(main_pos, args.role))  # fail early if a template is missing
+
+    sampler = PoolSampler(train_rows, seed=args.seed + 2)
+    data_rng = random.Random(args.seed + 1)
+    print(f"train: {len(train_rows)} samples {sampler.counts()}; val: {len(val_rows)} samples; "
+          f"unspecified-pool schedule {schedule.spec!r}")
+
+    # ---------------- model ----------------
+    transformer = build_transformer(args)
+    role = None
+    if args.role == "embed":
+        role = MainRoleEmbedding(transformer.inner_dim).to(DEVICE).attach(transformer)
+    sigmas = sigma_table(args)
+    sigma_gen = torch.Generator().manual_seed(args.seed + 3)
+
+    groups = [{"params": [p for p in transformer.parameters() if p.requires_grad],
+               "lr": args.lr, "weight_decay": args.weight_decay}]
+    if role is not None:
+        groups.append({"params": [role.e_main], "lr": args.role_lr, "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.999), eps=1e-8)
+    lr_sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: min(1.0, (s + 1) / max(1, args.warmup_steps)))
+    trainable = [p for g in groups for p in g["params"]]
+
+    step = 0
+    if args.resume:
+        step = load_checkpoint(args.resume, transformer, role, optimizer, lr_sched, sampler, data_rng)
+
+    # sample-image pipeline: the training transformer + VAE, prompts from the cache
+    vae = AutoencoderKL.from_pretrained(args.base_model, subfolder="vae", torch_dtype=DTYPE).to(DEVICE)
+    pipe = MultiRefKontextPipeline(
+        scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(args.base_model, subfolder="scheduler"),
+        vae=vae, text_encoder=None, tokenizer=None, text_encoder_2=None, tokenizer_2=None, transformer=transformer)
+    pipe.set_progress_bar_config(disable=True)
+    val_set = fixed_val_set(val_rows, store, args) if args.val_every else []
+    folders = image_folders(val_rows, args.image_folders) if args.image_every else []
+
+    writer = None
+    if args.tensorboard:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(args.output_dir / "tb")
+    log_path = args.output_dir / "log.jsonl"
+    with open(args.output_dir / "args.json", "w") as f:
+        json.dump({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, f, indent=2)
+
+    def log(record):
+        with open(log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        if writer is not None:
+            for k, v in record.items():
+                if k != "step" and isinstance(v, (int, float)):
+                    writer.add_scalar(k, v, record["step"])
+
+    if step == 0 and folders and not args.no_images_at_start:
+        print(f"sample images: {sample_images(pipe, role, folders, store, args, 0)}")
+    if step == 0 and val_set:
+        rec = {"step": 0, **validation_loss(transformer, role, val_set, args)}
+        log(rec)
+        print("step 0 " + " ".join(f"{k} {v:.4f}" for k, v in rec.items() if k != "step"))
+
+    # ---------------- training ----------------
+    transformer.train()
+    window = defaultdict(list)
+    t0 = time.time()
+    while step < args.max_steps:
+        p_unspec = schedule(step / args.max_steps)
+        for _ in range(args.grad_accum):
+            row, target = sampler.sample(p_unspec)
+            ex = make_example(row, target, store, args.role, data_rng, shuffle=not args.no_shuffle)
+            loss = forward_loss(transformer, role, ex, sample_sigma(args, sigmas, sigma_gen), None, args)
+            (loss / args.grad_accum).backward()
+            window["loss"].append(loss.item())
+            window[f"loss_{ex['pool']}"].append(loss.item())
+            window["designated"].append(float(ex["pool"] == "designated"))
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+        optimizer.step()
+        lr_sched.step()
+        optimizer.zero_grad(set_to_none=True)
+        step += 1
+        window["grad_norm"].append(float(grad_norm))
+
+        if step % args.log_every == 0 or step == args.max_steps:
+            rec = {"step": step, **{k: sum(v) / len(v) for k, v in window.items() if v},
+                   "p_unspec": p_unspec, "lr": lr_sched.get_last_lr()[0],
+                   "sec_per_step": (time.time() - t0) / args.log_every}
+            if role is not None:
+                rec["e_main_norm"] = role.e_main.detach().norm().item()
+            rec["designated_share"] = rec.pop("designated")
+            log(rec)
+            print(" ".join([f"step {step}"] + [f"{k} {v:.4g}" for k, v in rec.items() if k != "step"]))
+            window.clear()
+            t0 = time.time()
+        if val_set and step % args.val_every == 0:
+            rec = {"step": step, **validation_loss(transformer, role, val_set, args)}
+            log(rec)
+            print(f"step {step} " + " ".join(f"{k} {v:.4f}" for k, v in rec.items() if k != "step"))
+        if folders and step % args.image_every == 0:
+            print(f"sample images: {sample_images(pipe, role, folders, store, args, step)}")
+        if step % args.save_every == 0 or step == args.max_steps:
+            save_checkpoint(args.output_dir / f"checkpoint-{step:06d}", transformer, role, optimizer, lr_sched,
+                            step, sampler, data_rng, args)
+
+    if writer is not None:
+        writer.close()
+    print("done")
+
+
+if __name__ == "__main__":
+    main()

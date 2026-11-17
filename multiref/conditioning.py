@@ -234,18 +234,32 @@ class MultiRefKontextPipeline(FluxKontextPipeline):
             raise ValueError(f"Unknown role mode {role_mode!r}; expected one of {ROLE_MODES}")
         order, main_pos, template = arrange(len(references), main, role_mode, shuffle=False)
         latents = self.encode_references([references[i] for i in order], ref_size)
+        prompt = prompt or template
+        out = self.generate_from_latents(latents, main_pos, role_mode, layout, role_embedding,
+                                         height=height, width=width, prompt=prompt, **kwargs)
+        return out, {"order": order, "main_pos": main_pos, "prompt": prompt}
+
+    @torch.no_grad()
+    def generate_from_latents(self, ref_latents, main_pos=None, role_mode: str = "embed", layout: str = "canvas",
+                              role_embedding: MainRoleEmbedding | None = None, height: int = 1024, width: int = 1024,
+                              **kwargs):
+        """Generate from reference latents that are already in model order (e.g. cached latents).
+
+        ref_latents: list of [1, 16, h, w] normalized VAE latents, in model order
+        main_pos:    position of the main reference in that order, or None
+        kwargs:      passed to the pipeline: prompt or prompt_embeds + pooled_prompt_embeds, steps, guidance, ...
+                     (the prompt must match role_mode and main_pos, see multiref.prompts)
+        """
         multiple = self.vae_scale_factor * 2
         target_hw = (height // multiple, width // multiple)
-        tokens, ids, spans = build_reference_tokens(latents, layout, target_hw)
+        tokens, ids, spans = build_reference_tokens(ref_latents, layout, target_hw)
         if role_embedding is not None:
             role_embedding.set_main(spans, main_pos if role_mode == "embed" else None)
         self._multiref = (tokens, ids)
-        prompt = prompt or template
         try:
             # max_area must match height * width: the pipeline rescales the output to max_area
-            out = self(prompt=prompt, height=height, width=width, max_area=height * width, **kwargs)
+            return self(height=height, width=width, max_area=height * width, **kwargs)
         finally:
             self._multiref = None
             if role_embedding is not None:
                 role_embedding.clear()
-        return out, {"order": order, "main_pos": main_pos, "prompt": prompt}

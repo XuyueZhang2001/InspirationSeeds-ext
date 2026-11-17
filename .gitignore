@@ -140,3 +140,6 @@ test_quality/
 
 # Original versions
 original_code/
+
+# Runs
+runs/
