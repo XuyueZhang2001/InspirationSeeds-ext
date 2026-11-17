@@ -2,12 +2,15 @@
 
 This repository builds on [Inspiration Seeds](https://arxiv.org/abs/2602.08615) (Goldberg, Richardson, Vinker), which combines two input images into a new object using FLUX.1 Kontext with a LoRA trained on synthetic triplets. The triplets come from decomposing a source image into two concept clusters of CLIP-SAE features.
 
-The long-term goal of this fork is to support **N input images with an optional designated main subject** (earlier plan: controllable per-image weight levels). The current stage covers the data side:
+The long-term goal of this fork is to support **N input images with an optional designated main subject** (earlier plan: controllable per-image weight levels). The repository now covers data generation and a first fine-tuning pipeline:
 
-1. decomposing a source image into **N semantically distinct reference images** (N = 2–4, chosen per image). The current recommended script is **`decompose_v7_2.py`** (adaptive SAE feature grouping + an image-space subject subspace);
-2. synthesizing **designated-subject target images** from a decomposition (**`synthesize_v2_1.py`**): for every input designated as the main subject, a target pulled toward that input, so that the same input set gives different targets for different designations.
+1. decomposing a source image into **N semantically distinct reference images** (N = 2–4, chosen per image, 768 px): **`decompose_v7_2.py`** (adaptive SAE feature grouping + an image-space subject subspace);
+2. synthesizing **designated-subject target images** (1024 px): **`synthesize_v2_1.py`**: for every input designated as the main subject, a target pulled toward that input, so that the same input set gives different targets for different designations;
+3. selecting the targets by hand, with automatic suggestions: **`select_targets.py`**;
+4. building the training data: **`build_dataset.py`** and **`cache_features.py`**;
+5. fine-tuning FLUX.1 Kontext dev (new LoRA + a main-image role embedding) on 2–4 reference images with an optional main image: **`train_multiref.py`**; inference with **`generate_multi.py`**.
 
-Last README update: 2026-11-14.
+Last README update: 2026-11-17.
 
 ---
 
@@ -23,12 +26,60 @@ Last README update: 2026-11-14.
 | **`synthesize_v2_1.py`** | **Recommended** designated-subject target synthesis for `decompose_v7_2.py` outputs: closeness-dependent 2 × 2 grid of interpolation weight × img2img strength (see below) |
 | `synthesize_v2.py` | Previous version: the same synthesis with a full 3 × 3 grid for every main |
 | `synthesize_target.py` | Earlier level-based weighted target synthesis for `decompose.py` outputs |
+| **`select_targets.py`** | Suggests which synthesized targets to keep and writes review folders (`keep/`, `drop/`, `_overview.jpeg`) for the manual selection (see below) |
+| **`build_dataset.py`** | Training / validation manifests: unspecified samples (decomposition + source image) and designated samples (decomposition + kept targets) |
+| **`cache_features.py`** | Caches VAE latents (references 512 px, targets 1024 px) and the prompt embeddings, so training only needs the transformer |
+| **`train_multiref.py`** | LoRA + main-image role embedding fine-tuning of FLUX.1 Kontext dev with 2–4 references; pool schedule, validation images, checkpoints, overfitting test |
+| **`generate_multi.py`** | Inference with 2–4 images and an optional main image (`--main k`), with a trained LoRA and role embedding |
+| `check_multiref.py` | Sanity checks of the multi-reference conditioning against the stock Kontext pipeline, plus baseline images of the base model |
+| `multiref/` | Shared code: prompt templates (`prompts.py`), manifest / cache helpers (`data.py`), reference encoding, position ids, role embedding and pipeline (`conditioning.py`), training data sampling (`train_data.py`) |
 | `fetch_hf_samples.py` | Downloads a random subset of the paper's training data from Hugging Face |
 | `probe_inputs.py` | Checks whether the released model uses both inputs (swap / duplicate / blank conditions, DINOv2 and CLIP metrics) |
 | `summarize_none.py` | Prints a table of the unweighted (`none`) target measurements across folders |
 | `check_sae.py` | Small diagnostic that prints the SAE structure and decoder bias |
 | `assets/` | Example inputs from the original repository |
 | `docs/` | Paper PDF and teaser |
+
+---
+
+## Pipeline overview
+
+All scripts are run from the repository root. Paths below are the ones used so far.
+
+```bash
+SRC=hf_samples/sources
+
+# 1. decomposition (768 px inputs); good multi-subject folders are copied by hand to hf_generate_source/
+python decompose_v7_2.py --image-dir $SRC --output-dir output/decompose/hf_v72_final
+
+# 2. designated-subject targets (1024 px) for the hand-picked folders
+python synthesize_v2_1.py --root hf_generate_source --output-dir output/synth/v2_1_1024 --size 1024
+
+# 3. suggestions + manual selection in output/selection/review/<folder>/main<k>/keep|drop
+python select_targets.py --synth-root output/synth/v2_1_1024 --output-dir output/selection
+
+# 4. training data: manifests and cached latents / prompt embeddings
+python build_dataset.py --decomp-root output/decompose/hf_v72_final \
+    --review-dir output/selection/review --source-dir $SRC --output-dir data/multiref
+python cache_features.py --manifest-dir data/multiref --target-size 1024
+
+# 5. checks, overfitting test, training
+python check_multiref.py --folder output/decompose/hf_v72_final/<folder>
+python train_multiref.py --data-dir data/multiref --output-dir runs/overfit --overfit 8 \
+    --max-steps 1500 --warmup-steps 50 --grad-accum 1 --val-every 100 --image-every 250 --save-every 500
+python train_multiref.py --data-dir data/multiref --output-dir runs/v1 --max-steps 10000
+
+# 6. inference
+python generate_multi.py --folder output/decompose/hf_v72_final/<folder> --main 2 \
+    --lora runs/v1/checkpoint-010000/lora --role-embedding runs/v1/checkpoint-010000/role_embedding.safetensors
+```
+
+| Step | Resolution |
+|---|---|
+| Decomposed inputs (`decompose_v7_2.py --size`) | 768 × 768 |
+| Synthesized targets (`synthesize_v2_1.py --size`) | 1024 × 1024 (inputs upsampled as img2img init images) |
+| References in the model (`cache_features.py --ref-size`) | 512 × 512 (1024 tokens each), as in the original Inspiration Seeds |
+| Targets in the model (`cache_features.py --target-size`) and outputs | 1024 × 1024 (4096 tokens) |
 
 ---
 
@@ -39,7 +90,9 @@ Last README update: 2026-11-14.
 - An NVIDIA GPU is required (both scripts hard-code `cuda`).
 - `decompose*.py` (Kandinsky 2.2 + SAE): about 12–16 GB of VRAM.
 - `synthesize_v2_1.py` (Kandinsky 2.2 only, no SAE): at most the same as the decomposition.
-- `generate.py` (FLUX.1 Kontext dev, ~12B parameters, bf16): about 24 GB+ of VRAM, or use `pipe.enable_model_cpu_offload()`.
+- `generate.py`, `generate_multi.py`, `check_multiref.py` (FLUX.1 Kontext dev, ~12B parameters, bf16): about 24 GB+ of VRAM, or use `pipe.enable_model_cpu_offload()`.
+- `train_multiref.py` (transformer in bf16 + LoRA in fp32, gradient checkpointing, no quantization): developed on an 80 GB GPU; about 4 s per sample with 4 references and a 1024 px target. Single GPU; choose it with `CUDA_VISIBLE_DEVICES=1 python train_multiref.py ...`.
+- `cache_features.py` (VAE + text encoders, no transformer): less than the generation scripts.
 
 ### Environment
 
@@ -66,6 +119,7 @@ Notes:
 - An environment created with `uv venv` has no `pip`; install packages with `uv pip install`, not `pip install`.
 - Run scripts with `python ...` inside the activated environment, not `uv run ...` (which would build a separate environment from the script header).
 - The warning `CLIPImageProcessor requires torchvision` is harmless. Install `torchvision` from the same CUDA index to silence it.
+- Fine-tuning (`train_multiref.py`) needs `peft` (installed with the generation packages); `--tensorboard` additionally needs `uv pip install tensorboard`.
 
 ### Hugging Face access
 
@@ -138,7 +192,7 @@ Existing output folders are skipped unless `--overwrite` is given, so use a new 
 
 ### Data-generation runs
 
-The decompositions are used to build fine-tuning data, so every source folder is decomposed with **several settings**, and the good input sets are selected afterwards. All runs start from the defaults (`--alpha-r 0.7 --clean-frac 0.3`, no debug images) and change one thing at a time. Each run needs its own `--output-dir`, because the per-image folder name (`{stem}_topk64_nmax4`) does not contain the parameters.
+The decompositions are used to build fine-tuning data, so every source folder is decomposed with **several settings**, and the good input sets are selected afterwards. All runs start from the defaults (`--alpha-r 0.7 --clean-frac 0.3`, no debug images) and change one thing at a time. The per-image folder name is `{stem}_topk{K}_s{seed}_c{clean-frac}_a{alpha-r}_obj{alpha-obj}` (default: `{stem}_topk64_s1_c0.3_a0.7_obj0.5`), so runs that differ in these parameters get different folder names. `--n-max` and `--subject-restore` are **not** in the name, so the `restore` and `n2` runs would overwrite or skip the `base_s1` folders if they shared an output directory. Each run therefore still gets its own `--output-dir`, which also keeps the runs easy to compare.
 
 | Run | Arguments (added to the defaults) | What changes | When it gives better pairs |
 |---|---|---|---|
@@ -167,7 +221,7 @@ python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/obj03   --alpha-obj 
 python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/n2      --n-max 2
 ```
 
-Resulting layout: `output/hf_v72/<run>/<stem>_topk64_nmax{2|4}/` with `input_*.jpeg`, `overview.jpeg`, `embeds.pt`, `groups.json`, plus `output/hf_v72/<run>/summary.json`. For one source image there are therefore up to 9 candidate input sets; comparing the `overview.jpeg` of the same `<stem>` across runs is the quickest visual check.
+Resulting layout: `output/hf_v72/<run>/<stem>_topk64_s{seed}_c{c}_a{a}_obj{obj}/` (e.g. `output/hf_v72/c05/14_topk64_s1_c0.5_a0.7_obj0.5/`) with `input_*.jpeg`, `overview.jpeg`, `embeds.pt`, `groups.json`, plus `output/hf_v72/<run>/summary.json`. For one source image there are therefore up to 9 candidate input sets; comparing the `overview.jpeg` of the same `<stem>` across runs is the quickest visual check.
 
 Notes:
 - The subject subspaces are cached in `text_cache/` and shared by all runs (the prior settings are the same), so only the first run pays for them.
@@ -254,11 +308,11 @@ Defaults are the values in the code (updated 2026-11-14: `--clean-frac 0.3`, `--
 |---|---|---|
 | `--seed` | 1 | Kandinsky decoder seed, shared by all inputs. Changes only the rendering (layout, pose, details), not the embeddings or `groups.json`; weak content (small objects, weak groups) may appear for one seed and not another |
 | `--steps` | 50 | Kandinsky decoder steps |
-| `--size` | 768 | Output resolution |
+| `--size` | 768 | Output resolution. 768 gives better decompositions than 512; for training the inputs are downscaled to 512 when they are cached (`cache_features.py --ref-size`) |
 
 ### Output
 
-One folder per image: `<output-dir>/{image stem}_topk{top-k}_nmax{n-max}/` (the folder name does not contain the other parameters).
+One folder per image: `<output-dir>/{image stem}_topk{top-k}_s{seed}_c{clean-frac}_a{alpha-r}_obj{alpha-obj}/`, with numbers in their shortest form (`--alpha-r 1.0` → `a1`). `--n-max`, `--subject-restore` and the other parameters are not in the name. An existing folder with the same name is skipped unless `--overwrite` is given. Downstream scripts take the source stem as the part before `_topk`, so they accept both this naming and the older `{stem}_topk64_nmax4` folders.
 
 | File | Content |
 |---|---|
@@ -323,7 +377,7 @@ Input: decomposition folders written by `decompose_v7_2.py` (2–4 inputs per fo
 3. **Target embedding** for main input $k$ (one knob $t$, no per-image levels):
    $$e_T = (1 - t)\, e + t\, e_k, \qquad \text{rescaled to } \lVert e\rVert$$
    $t = 0$ is the source embedding, $t = 1$ is input $k$ itself. Moving toward $e_k$ amplifies group $k$ and attenuates the other groups.
-4. **Decoding with Kandinsky 2.2 img2img**: init image = `input_k.jpeg`, condition = $e_T$. The strength $s$ is the diffusers img2img strength, i.e. the fraction of the noise schedule applied to the init image; **larger $s$ = further from the main input**. About 0.4 keeps outline, details and colors; 0.7 keeps the rough layout and proportions; 0.9 almost ignores the init image. The number of denoising steps actually run is `int(steps * s)`. The img2img pipeline reuses the decoder's unet, scheduler and movq, so no extra weights are loaded.
+4. **Decoding with Kandinsky 2.2 img2img** at `--size` (1024 px, the size of the real source images that are the targets of unspecified samples): init image = `input_k.jpeg` (768 px, upsampled to 1024), condition = $e_T$. The strength $s$ is the diffusers img2img strength, i.e. the fraction of the noise schedule applied to the init image; **larger $s$ = further from the main input**. About 0.4 keeps outline, details and colors; 0.7 keeps the rough layout and proportions; 0.9 almost ignores the init image. The number of denoising steps actually run is `int(steps * s)`. The img2img pipeline reuses the decoder's unet, scheduler and movq, so no extra weights are loaded.
 5. **2 × 2 grid per main, chosen by class** (same seed for every cell):
 
    | Class | $t$ | $s$ | Reason |
@@ -338,7 +392,7 @@ Input: decomposition folders written by `decompose_v7_2.py` (2–4 inputs per fo
 
 ### How the grids were chosen
 
-`synthesize_v2.py` ran the full 3 × 3 grid ($t \in \{0, 0.3, 0.6\}$, $s \in \{0.4, 0.7, 0.9\}$) on 14 folders (41 mains); the best cell was picked by hand for 7 mains.
+`synthesize_v2.py` ran the full 3 × 3 grid ($t \in \{0, 0.3, 0.6\}$, $s \in \{0.4, 0.7, 0.9\}$) on 14 folders (41 mains, 768 px targets at the time); the best cell was picked by hand for 7 mains.
 
 - The input closest to the source ("dominant" input) had a closeness of 0.61–0.85, the other inputs 0.26–0.68. The dominant input was the v7.2 keeper in 11 of 14 folders.
 - **Close mains**: hand-picked cells (0, 0.9), (0, 0.9), (0.3, 0.7). Their `lift` was only +0.01 to +0.04, i.e. the target is close to the reconstruction.
@@ -351,8 +405,8 @@ In this analysis the closeness was approximated from `synthesize_v2.py` outputs;
 ### Usage
 
 ```bash
-# default: class-dependent 2 x 2 grid for every input of every folder
-python synthesize_v2_1.py --root hf_generate_source --output-dir output/synth/v2_1
+# default: class-dependent 2 x 2 grid for every input of every folder, 1024 px targets
+python synthesize_v2_1.py --root hf_generate_source --output-dir output/synth/v2_1_1024
 
 # try the first 3 folders only
 python synthesize_v2_1.py --limit 3
@@ -386,7 +440,7 @@ Folders that already contain `synth_meta.json` are skipped unless `--overwrite` 
 | `--embed-only` | off | Add a reference column decoded from $e_T$ alone (no init image) |
 | `--seed` | 1 | Kandinsky seed, shared by every cell |
 | `--steps` | 50 | Kandinsky steps; img2img runs `int(steps * s)` of them. Use the value of the decomposition run |
-| `--size` | 768 | Output resolution. Use the value of the decomposition run |
+| `--size` | 1024 | Target resolution (1024 = size of the real source images); the 768 px inputs are upsampled to it as img2img init images |
 | `--guidance-scale` | 4.0 | Decoder guidance scale |
 | `--tile` | 256 | Tile size in the overview image |
 | `--limit` | none | Only process the first N folders |
@@ -426,6 +480,234 @@ One folder per decomposition folder: `<output-dir>/<name>/`.
 
 ---
 
+## Target selection (`select_targets.py`)
+
+### Principle
+
+The script only **suggests** which synthesized cells to keep; the final choice is made by hand. The global CLIP measurements can filter out clear failures, but they cannot tell which of the remaining cells is best (e.g. $s = 0.7$ vs $0.9$), so every cell left in `keep/` is used as a target and training picks one of them at random.
+
+Every cell $(t, s)$ of every main $k$ is checked:
+
+| Reason | Condition (default) | Meaning |
+|---|---|---|
+| `copy` | `cos_main` > `--copy-max` (0.80) | near copy of the main input |
+| `no_effect` | `lift` < `--lift-min` (0.0) | not closer to the main than the plain reconstruction |
+| `not_dominant` | `margin` < `--margin-min` (−0.15) | still resembles another input more than the main |
+| `not_distinct` | `distinct` < `--distinct-min` (0.03) | cannot be told apart from the targets of the other mains of the folder |
+
+$$\text{distinct} = \cos(f(T), f(\text{input}_k)) - \max_{j \ne k}\ \overline{\cos(f(T_j), f(\text{input}_k))}$$
+
+where the mean runs over the cells of main $j$ that pass the first three checks (the check is skipped if no other main has such a cell). The thresholds were set on 14 folders with 768 px targets (all 6 hand-picked cells inside the v2.1 grids pass) and were not recalibrated for 1024 px.
+
+### Review folders
+
+```
+output/selection/
+    review/<folder>/
+        _overview.jpeg          everything needed to decide, in one image
+        _inputs.jpeg            all inputs, labelled input_0, input_1, ...
+        info.json               decomposition folder, inputs, original path of every cell (do not edit)
+        main<k>/
+            _main.jpeg          the main input k
+            keep/t0.30_s0.40.jpeg          suggested to keep
+            drop/t0.60_s0.40__copy.jpeg    suggested to drop (reasons after "__")
+    review/_created.txt         folders created so far (do not edit)
+    suggestions.csv             one row per cell: suggestion, reasons, metrics (rewritten on every run)
+    summary.json                thresholds and counts
+```
+
+`_overview.jpeg`: the first row shows all inputs; then one row per main with the main input and every candidate cell, captioned with the cell name (= file name), `cos_main`, `lift`, `margin`, `distinct`, the suggestion (green frame = keep, red = drop with the reasons) and **`now`**, i.e. whether the cell is currently in `keep/`. Images added to `keep/` by hand are appended with a blue frame.
+
+### Manual selection
+
+| To | Do |
+|---|---|
+| keep a cell | have its file in `keep/` (moving it from `drop/` without renaming is fine; the `__reason` suffix is ignored) |
+| drop a cell | move it out of `keep/` (or delete it) |
+| drop a whole main | empty its `keep/`, or delete `main<k>/` |
+| drop a whole folder | delete `review/<folder>/` |
+| add another image | copy it into `keep/` (e.g. a cell from another synthesis run); it must be generated from the same inputs |
+
+Nothing has to be recorded elsewhere: `build_dataset.py` reads the content of the `keep/` folders when it runs, and uses those files **as they are** as targets. The review folder is therefore part of the dataset.
+
+Rerunning `select_targets.py` never changes `keep/` / `drop/` of an existing folder and never recreates a deleted one (listed in `_created.txt`); it only redraws `_overview.jpeg` (so `now` reflects your changes) and adds new folders. `--overwrite` rebuilds everything from the suggestions and discards all manual changes.
+
+What to look for: the main input dominates (shape or pose kept, category may change); the other inputs visibly contribute (material, color, elements); a fused object, not a collage; no structural artifacts; and the targets of different mains of one folder look different (otherwise they teach nothing about the designation). One or two good cells per main are better than four mediocre ones.
+
+### Usage and parameters
+
+```bash
+python select_targets.py --synth-root output/synth/v2_1_1024 --output-dir output/selection
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--synth-root` | `output/synth/v2_1_1024` | Output root of `synthesize_v2_1.py` (searched for `synth_meta.json`) |
+| `--output-dir` | `output/selection` | Review folders, `suggestions.csv`, `summary.json` |
+| `--copy-max`, `--lift-min`, `--margin-min`, `--distinct-min` | 0.80, 0.0, −0.15, 0.03 | Thresholds of the suggestions |
+| `--overview-tile` | 288 | Image size in `_overview.jpeg` |
+| `--overwrite` | off | Rebuild every review folder from the suggestions (discards manual changes and deletions) |
+
+---
+
+## Training data (`build_dataset.py`, `cache_features.py`)
+
+### Sample pools
+
+| Pool | Inputs | Main | Target | Source |
+|---|---|---|---|---|
+| unspecified | `input_*.jpeg` of a decomposition folder | none | the original source image (path from `groups.json` → `image`, else `<stem>.*` in `--source-dir`) | every folder of `--decomp-root` (`output/decompose/hf_v72_final`), one sample each; `recon.jpeg` is not used |
+| designated | the same inputs | input $k$ | the files in `review/<folder>/main<k>/keep/`, one picked at random per draw | the review folders of `select_targets.py` |
+
+- **Input consistency.** The designated targets were synthesized on `hf_generate_source/`, a hand-picked copy of part of `hf_v72_final`. For every review folder the inputs are compared byte by byte with the folder of the same name in `--decomp-root`; if identical, the `hf_v72_final` paths are used (both pools share the cached latents), otherwise the inputs of the synthesis are kept and the folder is reported, because a target must come with the inputs it was synthesized from.
+- **Split by source image**, stratified: `--val-frac` (10 %) of the sources that have designated samples and 10 % of the others go to validation, so validation contains both pools.
+- **No ratio in the manifests.** The share of the two pools is decided during training by the pool schedule (see below); the manifests only record the pool of every sample, and the input order is shuffled at training time.
+
+Output (`--output-dir`, default `data/multiref`): `train.jsonl`, `val.jsonl` (one sample per line: `id`, `stem`, `pool`, `folder`, `n_inputs`, `inputs`, `main` (0-based or null), `targets`, `cells`) and `stats.json` (counts per split, pool and number of inputs; review folders whose inputs differ from `--decomp-root`).
+
+### Cache
+
+`cache_features.py` encodes every input at `--ref-size` (512 → latent [16, 64, 64]) and every target at `--target-size` (1024 → [16, 128, 128]) with the FLUX VAE (mode of the latent distribution, normalized like the pipeline; non-square images are center-cropped), and every prompt template with the T5 and CLIP text encoders (`max_sequence_length` 512). Files: `<cache-dir>/latents/<key>.pt`, `prompts.pt`, `config.json`. Existing latents are skipped, so the script can be rerun after the manifests change.
+
+**After a change in `keep/`, rerun `build_dataset.py` and then `cache_features.py`**: newly kept files are new paths and must be cached before training.
+
+### Usage and parameters
+
+```bash
+python build_dataset.py --decomp-root output/decompose/hf_v72_final \
+    --review-dir output/selection/review --source-dir hf_samples/sources --output-dir data/multiref
+python cache_features.py --manifest-dir data/multiref --target-size 1024
+```
+
+| Script | Argument | Default | Description |
+|---|---|---|---|
+| `build_dataset.py` | `--decomp-root` | `output/decompose/hf_v72_final` | Decomposition folders (unspecified pool) |
+| | `--review-dir` | `output/selection/review` | Review folders (designated pool) |
+| | `--source-dir` | `hf_samples/sources` | Fallback location of the source images |
+| | `--val-frac`, `--seed` | 0.1, 0 | Validation fraction of the source images, split seed |
+| | `--min-inputs`, `--max-inputs` | 2, 4 | Allowed number of inputs |
+| `cache_features.py` | `--manifest-dir`, `--cache-dir` | `data/multiref`, `<manifest-dir>/cache` | Manifests and cache location |
+| | `--ref-size`, `--target-size` | 512, 1024 | Resolution of the references and of the targets |
+| | `--base-model` | `black-forest-labs/FLUX.1-Kontext-dev` | VAE and text encoders |
+| | `--overwrite` | off | Recompute existing latents |
+
+---
+
+## Multi-reference fine-tuning (`train_multiref.py`)
+
+A new LoRA is trained on FLUX.1 Kontext dev (the paper's released LoRA is not used). The transformer and the diffusers pipeline are not modified; all multi-reference code is in `multiref/`.
+
+### Model input
+
+- **References.** Each reference is encoded separately (512 px → 32 × 32 = 1024 tokens). The groups are concatenated, contiguous and in model order, after the 4096 tokens of the image being generated. With 4 references the image sequence has 8192 tokens (the same number of reference tokens as the paper's 1024 px grid, without white padding).
+- **Position ids** $(t, h, w)$; the generated image has $t = 0$:
+  - `canvas` (default): $t = 1$ for every reference, groups side by side along $w$ (a "virtual canvas"); the same ids as concatenating the latents along the width for the stock pipeline, only in contiguous per-reference order;
+  - `per_t` (ablation): reference $k$ gets $t = k + 1$, with $h, w$ scaled so that every reference spans the whole grid of the generated image.
+- **Main image** (`--role`):
+
+  | Role mode | Order of the references | How the main image is marked | Prompt |
+  |---|---|---|---|
+  | `embed` (default) | shuffled | learnable vector $E_{main}$ (3072-d, zero-initialized) added to every token of the main reference after `transformer.x_embedder` (forward hook) | "… Use the marked image as the main object …" |
+  | `slot` | main first, others shuffled | position only | "… Use the first image as the main object …" |
+  | `index` | shuffled | named in the prompt | "… Use image k as the main object …" |
+
+  Without a main image, every mode uses the base prompt "Combine the elements in the reference images into a single object inspired by them." The generator only ever sees these fixed templates (`multiref/prompts.py`); free-form user text would be mapped to "main image k" or "none" beforehand.
+- **Pipeline.** `MultiRefKontextPipeline` overrides only `prepare_latents`, so that the injected reference tokens and ids are used instead of one encoded `image`. The output size must be passed together with `max_area = height × width` (the pipeline rescales the output to `max_area` otherwise); `generate_multi` does this.
+
+### Training step
+
+Batch 1, `--grad-accum` samples per optimizer step; as in the diffusers example `train_dreambooth_lora_flux_kontext.py` where possible.
+
+1. **Pool**: unspecified with probability `--unspec-schedule(progress)`, else designated.
+2. **Sample**: unspecified → uniform over folders; designated → uniform over folders, then mains, then kept targets (every source counts the same, however many mains and targets it has).
+3. **Order** of the references shuffled; prompt template of the main position; cached latents and prompt embeddings.
+4. **Noise**: $\sigma$ from the scheduler's training table (`--weighting-scheme none` = uniform, or `logit_normal`), $x_\sigma = (1-\sigma)\,x_0 + \sigma\,\varepsilon$, packed target tokens.
+5. **References** appended after the target tokens; $E_{main}$ set on the main reference (`embed`).
+6. **Loss**: MSE between the transformer output of the target tokens and $\varepsilon - x_0$ (timestep $\sigma$, guidance embedding `--guidance-scale` 3.5).
+
+Pool schedule (default `0:1.0,0.3:1.0,0.4:0.65`): unspecified samples only for the first 30 % of the steps (learn to combine the references), linear transition until 40 %, then 65 % unspecified / 35 % designated. A single value (`0.5`) is a constant probability.
+
+### Defaults
+
+| Item | Default |
+|---|---|
+| Base model | `black-forest-labs/FLUX.1-Kontext-dev` transformer, bf16, gradient checkpointing |
+| LoRA | rank 32, alpha 32, on the Linear layers **inside** the transformer blocks: image and text attention, both feed-forwards of the double blocks, `proj_mlp` / `proj_out` of the single blocks (the final output projection, also named `proj_out`, is excluded); weights in fp32, forward in bf16 autocast |
+| $E_{main}$ | zero init, own parameter group |
+| Optimizer | AdamW; LoRA lr 1e-4 (weight decay 1e-4), $E_{main}$ lr 1e-3 (no weight decay); 500 warmup steps, then constant; gradient clipping 1.0 |
+| Steps | `--max-steps` 10000 optimizer steps, `--grad-accum` 4 |
+
+### Validation, checkpoints, logs
+
+- **Validation loss** every `--val-every` steps on a fixed set of validation samples (fixed order, target, noise, $\sigma \in \{0.25, 0.5, 0.75\}$), reported per pool. Flow-matching losses decrease slowly even when samples are memorized: compare steps and pools, not absolute values.
+- **Sample images** every `--image-every` steps and at step 0 (`runs/<run>/samples/step_XXXXXX.jpeg`): a few validation folders, preferably with ≥ 2 designated mains; per folder the inputs, the generated images (no main, then each main) and the targets. Only the VAE is loaded in addition (prompts come from the cache).
+- **Checkpoints** every `--save-every` steps: `checkpoint-XXXXXX/lora/` (diffusers LoRA format), `role_embedding.safetensors`, `train_state.pt` (resume with `--resume`).
+- **Log** `log.jsonl` (optionally TensorBoard): loss per pool, gradient norm, pool probability, learning rate, `e_main_norm`, time per step.
+
+### Overfitting test
+
+`--overfit N` trains on about N fixed training samples (whole designated folders with all their mains, i.e. counterfactual pairs, plus unspecified samples), one target per main, uses the same samples for validation and draws the pools 50 : 50.
+
+```bash
+python train_multiref.py --data-dir data/multiref --output-dir runs/overfit \
+    --overfit 8 --max-steps 1500 --warmup-steps 50 --grad-accum 1 \
+    --val-every 100 --image-every 250 --save-every 500
+```
+
+What to check: the sample images approach the targets; for a designated folder the images of the different mains differ and follow their own targets; `val_loss_designated` approaches `val_loss_unspecified` (the gap is the ambiguity of an input set with several targets); `e_main_norm` grows steadily. With a checkpoint, `generate_multi.py` with and without `--role-embedding` should give different results for the same main, and reordering the inputs (same main) should not change the result much.
+
+### Parameters
+
+| Argument | Default | Description |
+|---|---|---|
+| `--data-dir`, `--cache-dir`, `--output-dir` | `data/multiref`, `<data-dir>/cache`, `runs/multiref` | Manifests, cache, run folder |
+| `--unspec-schedule` | `0:1.0,0.3:1.0,0.4:0.65` (`0.5` with `--overfit`) | Probability of the unspecified pool over training progress |
+| `--overfit` | 0 | Overfitting test on about N samples |
+| `--no-shuffle`, `--preload` | off | Fixed input order (debugging); keep all latents in memory |
+| `--role`, `--layout` | `embed`, `canvas` | Main-image designation; position ids of the references |
+| `--lora-rank`, `--lora-alpha`, `--lora-layers` | 32, = rank, see Defaults | LoRA configuration |
+| `--init-lora` | none | Start from LoRA weights with the same rank and layers |
+| `--guidance-scale` | 3.5 | Guidance embedding (use the same value at inference) |
+| `--max-steps`, `--grad-accum` | 10000, 4 | Optimizer steps, samples per step |
+| `--lr`, `--role-lr`, `--weight-decay`, `--warmup-steps`, `--max-grad-norm` | 1e-4, 1e-3, 1e-4, 500, 1.0 | Optimization |
+| `--weighting-scheme`, `--logit-mean`, `--logit-std` | `none`, 0, 1 | Timestep density |
+| `--log-every`, `--val-every`, `--val-samples` | 10, 500, 16 | Logging and validation loss |
+| `--image-every`, `--image-folders`, `--image-steps`, `--no-images-at-start` | 1000, 3, 28, off | Sample images |
+| `--save-every`, `--resume`, `--tensorboard` | 1000, none, off | Checkpoints and logging |
+
+---
+
+## Inference (`generate_multi.py`)
+
+```bash
+# base model (baseline)
+python generate_multi.py --folder output/decompose/hf_v72_final/<folder> --main 2
+
+# fine-tuned LoRA + role embedding (the same --role / --layout as in training)
+python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 \
+    --lora runs/v1/checkpoint-010000/lora --role-embedding runs/v1/checkpoint-010000/role_embedding.safetensors
+```
+
+`--main k` is 1-based in the given order; without it no image is designated. Defaults: `--ref-size 512`, `--size 1024`, `--steps 28`, `--guidance-scale 3.5`, `--num-seeds 4`. Output (`--output-dir`, default `outputs/multi`): one image and one preview (inputs with the main framed in red, result, prompt) per seed, and a json with the prompt and the model order of the inputs.
+
+## Sanity checks (`check_multiref.py`)
+
+```bash
+python check_multiref.py --folder output/decompose/hf_v72_final/<folder>   # all checks
+python check_multiref.py --skip-model                                      # check 0 only
+```
+
+| Check | Expected |
+|---|---|
+| 0 `canvas` tokens / ids equal the stock packing of width-concatenated latents (no weights needed) | PASS |
+| 1 one reference: `generate_multi` equals the stock pipeline (reference and output at `--size`) | max diff 0 |
+| 2 two references: equals the stock pipeline with width-concatenated latents up to token order | small difference |
+| 3 $E_{main} = 0$: hook on equals hook off | max diff 0 |
+| 4 a random $E_{main}$ changes only the tokens of the main reference | PASS |
+| 5 baseline images of the base model (no main, each main, `per_t`) | `outputs/check_multiref/baseline_<folder>.jpeg` |
+
+---
+
 ## Test images from the paper's training set
 
 Dataset: [`kfirgold99/Inspiration-Seeds-Training`](https://huggingface.co/datasets/kfirgold99/Inspiration-Seeds-Training) (2085 rows, Parquet, MIT). Columns:
@@ -460,6 +742,22 @@ A `Fatal Python error: PyGILState_Release` printed at interpreter exit comes fro
 - The SAE decoder bias alone decodes to a brown furry animal; inputs whose own group is weak are dominated by it and show unrelated animals.
 - A subject subspace built from CLIP text embeddings does not work (modality gap: `proj_ratio` ≈ 0.17 on the phone image, and removing it left the phone unchanged). The prior-based image-space subspace (v7.1) is in the same space as $e$.
 - Weakening the subject in every input made small subjects (a kite) disappear from all inputs; v7.2 keeps the subject in one input instead.
+
+### Multi-reference fine-tuning (first overfitting test)
+
+Setup: `--overfit 8` (one designated folder with 4 mains + 4 unspecified samples), 1500 steps, `--grad-accum 1`, pools 50 : 50, `--role embed`, default learning rates.
+
+| | Step 0 | Step 1500 |
+|---|---|---|
+| `val_loss_unspecified` | 0.416 | 0.357 |
+| `val_loss_designated` | 0.475 | 0.445 |
+| `e_main_norm` | 0 | 1.05 |
+
+- **Combining the references works**: for the unspecified samples the sample images match the targets.
+- **The designation is not learned**: in the designated folder, "no main" and all four mains give the same image (the unspecified target), and the designated validation loss hardly decreases. The four mains share the prompt and the input order is shuffled, so $E_{main}$ is the only cue; it grows slowly (0.25 at step 160, 1.05 at step 1500, with long plateaus), i.e. its gradient has no consistent direction. A 3072-d vector of norm ≈ 1 is probably a small perturbation of the token states, so the model cannot use it, and therefore $E_{main}$ gets no consistent signal. The extra prompt sentence ("no main" vs "main") has no visible effect either.
+- The training loss printed every 10 steps is dominated by the random $\sigma$ and pool of each sample; only the fixed validation loss shows trends.
+
+Running next: `--role slot` (designation by position, no $E_{main}$) and `--role-lr 1e-2` on the same subset.
 
 ### Fixed-K baseline
 
@@ -514,15 +812,29 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 ### Designated-subject synthesis (`synthesize_v2_1.py`)
 
 1. **Provisional grids and threshold.** The close / far threshold and both 2 × 2 grids come from 7 hand-picked cells on 14 folders.
-2. **Coarse measurements.** `cos_main`, `lift` and `margin` use global CLIP features: they show whether the target moved toward the main, but cannot tell $s = 0.7$ from $s = 0.9$ (shape and layout), so the best cell is still picked visually. No automatic selection or filtering is implemented yet.
+2. **Coarse measurements.** `cos_main`, `lift` and `margin` use global CLIP features: they show whether the target moved toward the main, but cannot tell $s = 0.7$ from $s = 0.9$ (shape and layout), so `select_targets.py` only suggests and the final selection is manual. Its thresholds were not recalibrated for 1024 px targets.
 3. **Close mains barely change.** For close mains the selected targets are close to the reconstruction (`lift` +0.01 to +0.04).
 4. **Some mains have no usable cell**, and some change abruptly between $s = 0.4$ (near copy) and $s = 0.7$ (main lost).
 5. **Targets of different mains can look alike** when the inputs of a folder are similar; such input sets do not give useful counterfactual pairs.
-6. **Synthesized targets are Kandinsky images** (768 px) and have a lower quality than the real source images used as targets of unspecified samples.
+6. **Synthesized targets are Kandinsky images** (1024 px, generated from 768 px inputs) and have a lower quality than the real source images used as targets of unspecified samples. Kandinsky 2.2 is mostly used at 512–768 px; at 1024 px check the overviews for repeated structures, and the far-class $s = 0.4$ cells for blur (the upsampled init image is kept the most there).
+
+### Multi-reference fine-tuning (`train_multiref.py`)
+
+1. **Designation not learned yet** (see *Current findings*): with `--role embed` the role embedding stays too small to be used.
+2. **Quality gap between the pools.** Unspecified targets are real images, designated targets are Kandinsky images; the model could associate "designated" with the Kandinsky look. Compare the image quality of both modes on validation folders.
+3. **Single GPU only**; no multi-GPU or distributed training.
+4. **`--init-lora`** needs the same rank and target layers; the paper's AI-Toolkit LoRA may not match (the number of unexpected keys is printed).
+5. **Sample images are slow** (28 denoising steps per condition, ≈ 25 s per logging interval in which they are made); use `--no-images-at-start` or a larger `--image-every` for long runs.
 
 ---
 
 ## Next steps
+
+### Multi-reference fine-tuning
+
+1. **Make the designation learnable**: compare `--role slot` and `--role-lr 1e-2` with the first run on the same overfitting subset. If $E_{main}$ stays weak: initialize it at the scale of the token states, or mark the main reference through the position ids (axis 0) instead of a learned vector; log $\lVert E_{main}\rVert$ relative to the mean token norm of the main reference.
+2. **Full training run** with the pool schedule once the overfitting test shows that the images follow the designated main.
+3. **Evaluation script** (`eval_multiref.py`, planned): designation accuracy (`cos_main`, `margin` of the outputs), permutation invariance (same main, shuffled inputs), designation following (switching the main changes the output toward the new main), balance without a main (every input used), copy and collage detection.
 
 ### Adaptive decomposition
 
@@ -530,7 +842,7 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 2. **Bias-dominated groups**: detect inputs with a high `cos_to_bias` / weak own group and drop or merge them.
 3. **Several subjects**: handle the top nouns with a sufficient margin, each kept in one input.
 4. **Seed stability** as a filter: decode with 2–3 seeds and keep inputs whose content is stable.
-5. **Automatic cell selection for `synthesize_v2_1.py`**: label more mains, then set thresholds on `cos_main`, `lift` and `margin` (and a structural metric such as DINO) to pick one cell per main and drop mains without a usable cell; check per folder that the targets of different mains are distinguishable.
+5. **Calibrate the suggestions of `select_targets.py`** against the manual selection (cells moved between `keep/` and `drop/`) on 1024 px targets, and add a structural metric such as DINO to tell shape-preserving cells apart.
 
 ### Fixed-K baseline (earlier plan)
 

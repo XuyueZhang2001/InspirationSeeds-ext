@@ -1,7 +1,8 @@
 """
 decompose_v7_2.py (v7.2) -- adaptive SAE feature grouping with coverage expansion,
 input-based merging and an image-space subject kept in exactly one input.
-Last modified: 2026-11-17 (help text of --size; default stays 768)
+Last modified: 2026-11-17 (output folder name <stem>_topk<K>_s<seed>_c<clean-frac>_a<alpha-r>_obj<alpha-obj>,
+               was <stem>_topk<K>_nmax<n-max>; help text of --size, default stays 768)
 
 What changed in v7.2 (compared with decompose_v7_1.py)
 -----------------------------------------------------
@@ -577,10 +578,20 @@ def make_overview(cells, out_path: Path, tile=256):
 # --------------------------------------------------------------------------------------
 # Per image
 # --------------------------------------------------------------------------------------
+def output_folder_name(stem: str, args) -> str:
+    """Per-image output folder: <stem>_topk<K>_s<seed>_c<clean-frac>_a<alpha-r>_obj<alpha-obj>.
+
+    Example: 14_topk64_s1_c0.3_a0.7_obj0.5. Runs that differ in one of these settings no longer
+    overwrite or skip each other's folders. The stem is everything before "_topk".
+    """
+    return (f"{stem}_topk{args.top_k}_s{args.seed}_c{args.clean_frac:g}"
+            f"_a{args.alpha_r:g}_obj{args.alpha_obj:g}")
+
+
 @torch.inference_mode()
 def process_image(image_path: Path, args, models):
     prior, decoder, negative_emb, sae, subj_model = models
-    out = Path(args.output_dir) / f"{image_path.stem}_topk{args.top_k}_nmax{args.n_max}"
+    out = Path(args.output_dir) / output_folder_name(image_path.stem, args)
     if (out / "groups.json").exists() and not args.overwrite:
         print(f"[skip] {out}")
         return None
