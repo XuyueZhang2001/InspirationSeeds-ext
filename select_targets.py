@@ -23,25 +23,41 @@ all 6 pass. They are only suggestions and were not recalibrated for 1024 px targ
 Review folders (--output-dir/review)
 ------------------------------------
     review/<folder>/
+        _overview.jpeg          everything needed to decide, in one image (see below)
         _inputs.jpeg            all inputs of the folder, labelled input_0, input_1, ...
         info.json               decomposition folder, inputs, original path of every cell (do not edit)
         main<k>/
             _main.jpeg          the main input k
             keep/t0.30_s0.40.jpeg            suggested to keep
             drop/t0.60_s0.40__copy.jpeg      suggested to drop (reasons after "__")
+    review/_created.txt         folders created so far (do not edit): a folder listed here is never
+                                recreated, so deleting review/<folder>/ removes it for good
+
+_overview.jpeg
+    row 1        all inputs of the folder
+    one row per main: the main input, then every candidate cell with
+        - its name (= file name in keep/ / drop/)
+        - cos_main, lift, margin, distinct
+        - the suggestion: frame green (keep) or red (drop, with the reasons)
+        - "now": whether the cell is CURRENTLY in keep/ (reflects your manual changes)
+      images added to keep/ by hand (not one of the cells) are appended with a blue frame
+    The overview is redrawn on every run, also for existing folders; keep/ and drop/ are
+    never changed by a rerun.
 
 Manual selection:
     * keep a cell        -> its file is in keep/   (move it from drop/ to keep/ if needed)
     * drop a cell        -> move (or delete) it out of keep/
     * drop a whole main  -> leave its keep/ empty, or delete main<k>/
-    * drop a whole folder-> delete review/<folder>/
+    * drop a whole folder-> delete review/<folder>/ (it is not recreated by a rerun)
     * add any other image -> copy it into keep/ (e.g. a cell from another synthesis run); it must
                             be generated from the same inputs. build_dataset.py uses the files in
                             keep/ as they are, so the file name does not matter.
     Moving a file from drop/ to keep/ without renaming is fine: the "__reason" suffix is ignored.
 
-Rerunning the script never touches an existing review/<folder>/ (your edits are kept); new
-folders are added. Use --overwrite to rebuild every review folder from the suggestions.
+Rerunning the script never touches keep/ and drop/ of an existing review/<folder>/ (your edits
+are kept) and never recreates a deleted one; only _overview.jpeg is redrawn and new folders are
+added. Use --overwrite to rebuild every review folder from the suggestions (discards all edits,
+also deletions).
 
 Other output (--output-dir)
 ---------------------------
@@ -63,9 +79,11 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from multiref.data import list_inputs
+from multiref.data import IMAGE_EXTS, list_inputs
 
 REQUIRED_CELL_FIELDS = ("cos_main", "lift", "margin", "cos_inputs", "file", "t", "strength")
+CREATED_FILE = "_created.txt"
+GREEN, RED, BLUE, GRAY = (40, 160, 40), (210, 40, 40), (40, 90, 220), (120, 120, 120)
 
 
 def cell_name(t: float, s: float) -> str:
@@ -131,6 +149,91 @@ def inputs_strip(paths, out_path: Path, tile=256):
     canvas.save(out_path, quality=92)
 
 
+def load_font(size):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # older Pillow
+        return ImageFont.load_default()
+
+
+def open_tile(path, tile):
+    path = Path(path)
+    im = Image.open(path).convert("RGB") if path.exists() else Image.new("RGB", (tile, tile), "gray")
+    return im.resize((tile, tile))
+
+
+def write_overview(review_dir: Path, inputs, per_main, synth_dir: Path, tile: int = 288):
+    """_overview.jpeg: inputs, then per main the main input and every candidate with metrics and status."""
+    font, small = load_font(16), load_font(14)
+    gap, line = 10, 17
+    cap_cell = 5 * line + 6     # name, 2 metric lines, suggestion, current status
+    cap_head = 3 * line + 6
+    frame = 5
+
+    # one row per main: (main tile, main caption lines, [cells]); a cell = (image, lines, frame color)
+    main_rows = []
+    for k, m in sorted(per_main.items()):
+        main_dir = review_dir / f"main{k}"
+        removed = not main_dir.is_dir()
+        kept_files = []
+        if (main_dir / "keep").is_dir():
+            kept_files = sorted(x for x in (main_dir / "keep").iterdir() if x.suffix.lower() in IMAGE_EXTS)
+        kept_names = {x.stem.split("__")[0] for x in kept_files}
+        cells, cell_names = [], set()
+        for c in sorted(m["cells"], key=lambda c: (c["t"], c["strength"])):
+            name = cell_name(c["t"], c["strength"])
+            cell_names.add(name)
+            dist = "n/a" if c["distinct"] is None else f"{c['distinct']:+.2f}"
+            suggestion = ("suggest: KEEP", GREEN) if c["keep"] else ("drop: " + ",".join(c["reasons"]), RED)
+            now = ("now: removed with main", GRAY) if removed else (
+                ("now: IN keep/", GREEN) if name in kept_names else ("now: not kept", GRAY))
+            lines = [(name, "black"),
+                     (f"cos_main {c['cos_main']:.2f}  lift {c['lift']:+.2f}", "black"),
+                     (f"margin {c['margin']:+.2f}  distinct {dist}", "black"),
+                     suggestion, now]
+            cells.append((open_tile(synth_dir / c["file"], tile), lines, GREEN if c["keep"] else RED))
+        for x in kept_files:  # images added to keep/ by hand
+            if x.stem.split("__")[0] not in cell_names:
+                cells.append((open_tile(x, tile), [(x.name, "black"), ("added by hand", BLUE),
+                                                   ("", "black"), ("", "black"), ("now: IN keep/", GREEN)], BLUE))
+        closeness = "" if m["closeness"] is None else f" {m['closeness']:.2f}"
+        head = [(f"main = input_{k}", "black"), (f"{m['class'] or ''}{closeness}", "black"),
+                ("REMOVED" if removed else f"in keep/: {len(kept_files)}", RED if removed else "black")]
+        main_rows.append((open_tile(inputs[k], tile), head, cells))
+
+    n_cols = max([len(inputs)] + [1 + len(cells) for _, _, cells in main_rows])
+    W = gap + n_cols * (tile + gap)
+    title_h = 2 * line + 2 * gap
+    H = title_h + (tile + cap_head + gap) + len(main_rows) * (tile + cap_cell + 2 * gap)
+    canvas = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(canvas)
+    draw.text((gap, gap), review_dir.name, fill="black", font=font)
+    draw.text((gap, gap + line + 2), "frame: suggestion (green keep / red drop / blue added by hand); "
+              "'now' = current content of keep/", fill=GRAY, font=small)
+
+    y = title_h
+    for i, p in enumerate(inputs):
+        x = gap + i * (tile + gap)
+        canvas.paste(open_tile(p, tile), (x, y))
+        draw.text((x + 2, y + tile + 4), f"input_{i}", fill="black", font=font)
+    y += tile + cap_head + gap
+
+    for main_tile, head, cells in main_rows:
+        draw.line([(gap, y - gap // 2), (W - gap, y - gap // 2)], fill=GRAY, width=1)
+        canvas.paste(main_tile, (gap, y + gap // 2))
+        for j, (text, color) in enumerate(head):
+            draw.text((gap + 2, y + gap // 2 + tile + 4 + j * line), text, fill=color, font=small)
+        for c, (im, lines, color) in enumerate(cells):
+            x = gap + (c + 1) * (tile + gap)
+            yy = y + gap // 2
+            canvas.paste(im, (x, yy))
+            draw.rectangle([x - 2, yy - 2, x + tile + 1, yy + tile + 1], outline=color, width=frame)
+            for j, (text, tcolor) in enumerate(lines):
+                draw.text((x + 2, yy + tile + 4 + j * line), text, fill=tcolor, font=small)
+        y += tile + cap_cell + 2 * gap
+    canvas.save(review_dir / "_overview.jpeg", quality=88)
+
+
 def write_review_folder(review_dir: Path, folder: Path, synth_dir: Path, inputs, per_main):
     """review/<folder>/ with _inputs.jpeg, info.json and main<k>/{_main.jpeg, keep/, drop/}."""
     review_dir.mkdir(parents=True, exist_ok=True)
@@ -169,8 +272,9 @@ def main():
     p.add_argument("--lift-min", type=float, default=0.0, help="Suggest dropping cells with lift below this")
     p.add_argument("--margin-min", type=float, default=-0.15, help="Suggest dropping cells with margin below this")
     p.add_argument("--distinct-min", type=float, default=0.03, help="Suggest dropping cells with distinctness below this")
+    p.add_argument("--overview-tile", type=int, default=288, help="Image size in _overview.jpeg")
     p.add_argument("--overwrite", action="store_true",
-                   help="Rebuild existing review folders from the suggestions (discards manual edits)")
+                   help="Rebuild every review folder from the suggestions (discards manual edits and deletions)")
     args = p.parse_args()
 
     metas = sorted(args.synth_root.rglob("synth_meta.json"))
@@ -178,10 +282,16 @@ def main():
         raise FileNotFoundError(f"No synth_meta.json under {args.synth_root}")
     review_root = args.output_dir / "review"
     review_root.mkdir(parents=True, exist_ok=True)
+    created_path = review_root / CREATED_FILE
+    created = set() if args.overwrite or not created_path.exists() else \
+        {x.strip() for x in created_path.read_text().splitlines() if x.strip()}
+    # review folders made by an earlier version of this script (before _created.txt existed)
+    created |= {d.name for d in review_root.iterdir() if d.is_dir() and (d / "info.json").exists()} \
+        if not args.overwrite else set()
 
     rows = []
     reason_counts = Counter()
-    n_new = n_kept_existing = n_keep = n_cells = n_mains = n_mains_keep = 0
+    n_new = n_kept_existing = n_deleted = n_keep = n_cells = n_mains = n_mains_keep = 0
     for meta_path in metas:
         with open(meta_path) as f:
             meta = json.load(f)
@@ -212,14 +322,20 @@ def main():
                              "target": str(synth_dir / c["file"])})
 
         review_dir = review_root / name
-        if review_dir.exists() and not args.overwrite:
+        if name in created:
+            if not review_dir.exists():   # deleted by hand: the folder stays excluded
+                n_deleted += 1
+                continue
             n_kept_existing += 1
-            continue
-        if review_dir.exists():
-            shutil.rmtree(review_dir)
-        write_review_folder(review_dir, folder, synth_dir, inputs, per_main)
-        n_new += 1
+        else:
+            if review_dir.exists():
+                shutil.rmtree(review_dir)
+            write_review_folder(review_dir, folder, synth_dir, inputs, per_main)
+            created.add(name)
+            n_new += 1
+        write_overview(review_dir, inputs, per_main, synth_dir, tile=args.overview_tile)
 
+    created_path.write_text("\n".join(sorted(created)) + "\n")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with open(args.output_dir / "suggestions.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -231,6 +347,7 @@ def main():
         "folders": len(metas), "mains": n_mains, "mains_with_a_suggested_cell": n_mains_keep,
         "cells": n_cells, "cells_suggested_keep": n_keep, "drop_reasons": dict(reason_counts),
         "review_folders_written": n_new, "review_folders_left_unchanged": n_kept_existing,
+        "review_folders_deleted_by_hand": n_deleted,
     }
     with open(args.output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -238,7 +355,9 @@ def main():
     print(f"{len(metas)} folder(s), {n_mains} main(s), {n_cells} cell(s)")
     print(f"suggested keep: {n_keep} / {n_cells} cells; mains with at least one suggested cell: {n_mains_keep} / {n_mains}")
     print("drop reasons (a cell can have several): " + ", ".join(f"{k} {v}" for k, v in reason_counts.most_common()))
-    print(f"review folders: {n_new} written, {n_kept_existing} left unchanged (manual edits kept) -> {review_root}")
+    print(f"review folders: {n_new} written, {n_kept_existing} left unchanged (manual edits kept), "
+          f"{n_deleted} deleted by hand (not recreated) -> {review_root}")
+    print("overview images redrawn: review/<folder>/_overview.jpeg")
     print(f"suggestions table: {args.output_dir / 'suggestions.csv'}")
 
 
