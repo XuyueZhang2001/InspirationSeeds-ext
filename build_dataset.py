@@ -1,9 +1,9 @@
 """
 build_dataset.py -- training / validation manifests for multi-reference fine-tuning.
-Last modified: 2026-11-17
+Last modified: 2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
 
 Two sample pools:
-    unspecified  every decomposition folder in --decomp-root (output/decompose/hf_v72_final):
+    unspecified  every decomposition folder in --decomp-root (output/decompose/v72_final):
                  inputs = input_0.jpeg, input_1.jpeg, ...; no main image;
                  target = the original source image (path from groups.json "image", or found by
                  stem in --source-dir); recon.jpeg is not used
@@ -14,8 +14,8 @@ Two sample pools:
                  drop or images from other runs; the review folder is therefore part of the
                  dataset and must not be deleted before cache_features.py has run.
 
-The designated samples were synthesized on hf_generate_source, a hand-picked copy of part of
-hf_v72_final. For every review folder, the inputs are compared byte by byte with the folder of
+The designated samples were synthesized on generate_source, a hand-picked copy of part of
+v72_final. For every review folder, the inputs are compared byte by byte with the folder of
 the same name in --decomp-root: if they are identical, the --decomp-root paths are used (both
 pools then share the cached input latents); otherwise the inputs used for the synthesis are
 kept and the folder is reported, because a target must always come with the inputs it was
@@ -37,7 +37,7 @@ Output (--output-dir)
 
 Usage
 -----
-    python build_dataset.py --decomp-root output/decompose/hf_v72_final \\
+    python build_dataset.py --decomp-root output/decompose/v72_final \\
         --review-dir output/selection/review --output-dir data/multiref
 """
 
@@ -102,11 +102,11 @@ def stratified_split(stems_designated, stems_other, frac, rng):
 
 def main():
     p = argparse.ArgumentParser(description="Build manifests for multi-reference fine-tuning")
-    p.add_argument("--decomp-root", type=Path, default=Path("output/decompose/hf_v72_final"),
+    p.add_argument("--decomp-root", type=Path, default=Path("output/decompose/v72_final"),
                    help="Decomposition folders (searched recursively); each gives one unspecified sample")
     p.add_argument("--review-dir", type=Path, default=Path("output/selection/review"),
                    help="Manual review folders from select_targets.py (designated samples)")
-    p.add_argument("--source-dir", type=Path, default=Path("hf_samples/sources"),
+    p.add_argument("--source-dir", type=Path, default=Path("samples/sources"),
                    help="Fallback location of the source images (<stem>.<ext>) if groups.json has no valid path")
     p.add_argument("--output-dir", type=Path, default=Path("data/multiref"))
     p.add_argument("--val-frac", type=float, default=0.1, help="Fraction of source images used for validation")

@@ -1,6 +1,6 @@
 """
 generate_multi.py -- combine 2-4 reference images with FLUX.1 Kontext, optionally with a main image.
-Last modified: 2026-11-16
+Last modified: 2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
 
 Inputs are given either as a list of images (--images) or as a decomposition folder
 (--folder, uses its input_0.jpeg, input_1.jpeg, ...). --main k (1-based, in the given order)
@@ -18,7 +18,7 @@ The prompt is always one of the fixed templates in multiref/prompts.py.
 Usage
 -----
     # base model, no fine-tuning (baseline)
-    python generate_multi.py --folder hf_generate_source/<name> --main 2
+    python generate_multi.py --folder generate_source/<name> --main 2
 
     # fine-tuned LoRA + role embedding
     python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 \\

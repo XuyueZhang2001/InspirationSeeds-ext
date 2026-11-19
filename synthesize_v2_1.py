@@ -1,6 +1,7 @@
 """
 synthesize_v2_1.py (v2.1) -- designated-subject targets with an automatic 2 x 2 grid per main.
-Last modified: 2026-11-17 (default --size 768 -> 1024, the target size of the original Inspiration Seeds)
+Last modified: 2026-11-18 (default --root hf_generate_source -> generate_source)
+               2026-11-17 (default --size 768 -> 1024, the target size of the original Inspiration Seeds)
 
 What changed in v2.1 (compared with synthesize_v2.py)
 ----------------------------------------------------
@@ -62,7 +63,7 @@ per designated input, one row per t (first cell = the main input), one column pe
 Usage
 -----
     # default: class-dependent 2 x 2 grid for every input of every folder
-    python synthesize_v2_1.py --root hf_generate_source --output-dir output/synth/v2_1
+    python synthesize_v2_1.py --root generate_source --output-dir output/synth/v2_1
 
     # other threshold / grids
     python synthesize_v2_1.py --close-threshold 0.65 --far-s 0.4,0.55,0.7
@@ -402,7 +403,7 @@ def process_folder(folder: Path, out: Path, args, models):
 # --------------------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description="synthesize_v2.1: designated-subject targets, class-dependent 2 x 2 grid")
-    p.add_argument("--root", default="hf_generate_source",
+    p.add_argument("--root", default="generate_source",
                    help="Directory with decomposition folders (or one such folder)")
     p.add_argument("--output-dir", default="output/synth/v2_1")
     p.add_argument("--close-threshold", type=float, default=0.6,

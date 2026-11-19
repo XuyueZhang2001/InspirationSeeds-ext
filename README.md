@@ -47,30 +47,30 @@ Last README update: 2026-11-17.
 All scripts are run from the repository root. Paths below are the ones used so far.
 
 ```bash
-SRC=hf_samples/sources
+SRC=samples/sources
 
-# 1. decomposition (768 px inputs); good multi-subject folders are copied by hand to hf_generate_source/
-python decompose_v7_2.py --image-dir $SRC --output-dir output/decompose/hf_v72_final
+# 1. decomposition (768 px inputs); good multi-subject folders are copied by hand to generate_source/
+python decompose_v7_2.py --image-dir $SRC --output-dir output/decompose/v72_final
 
 # 2. designated-subject targets (1024 px) for the hand-picked folders
-python synthesize_v2_1.py --root hf_generate_source --output-dir output/synth/v2_1_1024 --size 1024
+python synthesize_v2_1.py --root generate_source --output-dir output/synth/v2_1_1024 --size 1024
 
 # 3. suggestions + manual selection in output/selection/review/<folder>/main<k>/keep|drop
 python select_targets.py --synth-root output/synth/v2_1_1024 --output-dir output/selection
 
 # 4. training data: manifests and cached latents / prompt embeddings
-python build_dataset.py --decomp-root output/decompose/hf_v72_final \
+python build_dataset.py --decomp-root output/decompose/v72_final \
     --review-dir output/selection/review --source-dir $SRC --output-dir data/multiref
 python cache_features.py --manifest-dir data/multiref --target-size 1024
 
 # 5. checks, overfitting test, training
-python check_multiref.py --folder output/decompose/hf_v72_final/<folder>
+python check_multiref.py --folder output/decompose/v72_final/<folder>
 python train_multiref.py --data-dir data/multiref --output-dir runs/overfit --overfit 8 \
     --max-steps 1500 --warmup-steps 50 --grad-accum 1 --val-every 100 --image-every 250 --save-every 500
 python train_multiref.py --data-dir data/multiref --output-dir runs/v1 --max-steps 10000
 
 # 6. inference
-python generate_multi.py --folder output/decompose/hf_v72_final/<folder> --main 2 \
+python generate_multi.py --folder output/decompose/v72_final/<folder> --main 2 \
     --lora runs/v1/checkpoint-010000/lora --role-embedding runs/v1/checkpoint-010000/role_embedding.safetensors
 ```
 
@@ -172,20 +172,20 @@ Steps 9–11 replaced two earlier ideas that did not work: weakening the subject
 
 ```bash
 # default setting (alpha_r 0.7, cleaning 0.3), no debug images
-python decompose_v7_2.py --image-dir hf_samples/sources --output-dir output/hf_v72
+python decompose_v7_2.py --image-dir samples/sources --output-dir output/v72
 
 # one image, with diagnostic images
-python decompose_v7_2.py --image hf_samples/sources/<name>.jpeg --output-dir output/v72_test --debug-images
+python decompose_v7_2.py --image samples/sources/<name>.jpeg --output-dir output/v72_test --debug-images
 
 # another decoding seed (same embeddings, different renderings)
-python decompose_v7_2.py --image-dir hf_samples/sources --output-dir output/hf_v72_seed2 --seed 2
+python decompose_v7_2.py --image-dir samples/sources --output-dir output/v72_seed2 --seed 2
 
 # other cleaning fraction / shared-part strength
-python decompose_v7_2.py --image-dir hf_samples/sources --output-dir output/hf_v72_c05 --clean-frac 0.5
+python decompose_v7_2.py --image-dir samples/sources --output-dir output/v72_c05 --clean-frac 0.5
 
 # force the subject noun for some images
 echo '{"14": "kite", "phone_01": "smartphone"}' > subjects.json
-python decompose_v7_2.py --image-dir hf_samples/sources --output-dir output/hf_v72 --subject-map subjects.json
+python decompose_v7_2.py --image-dir samples/sources --output-dir output/v72 --subject-map subjects.json
 ```
 
 Existing output folders are skipped unless `--overwrite` is given, so use a new `--output-dir` for every setting. The first time a noun is used, its subspace costs 2 × 40 × `--prior-samples` prior runs (batched); afterwards it is read from `text_cache/`.
@@ -207,8 +207,8 @@ The decompositions are used to build fine-tuning data, so every source folder is
 | `n2` | `--n-max 2` | At most two inputs | Two-input pairs as in the paper; lower-salience groups become minor and are removed |
 
 ```bash
-SRC=hf_samples/sources          # source folder
-OUT=output/hf_v72               # one subfolder per run
+SRC=samples/sources          # source folder
+OUT=output/v72               # one subfolder per run
 
 python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/base_s1 --seed 1
 python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/base_s2 --seed 2
@@ -221,7 +221,7 @@ python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/obj03   --alpha-obj 
 python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/n2      --n-max 2
 ```
 
-Resulting layout: `output/hf_v72/<run>/<stem>_topk64_s{seed}_c{c}_a{a}_obj{obj}/` (e.g. `output/hf_v72/c05/14_topk64_s1_c0.5_a0.7_obj0.5/`) with `input_*.jpeg`, `overview.jpeg`, `embeds.pt`, `groups.json`, plus `output/hf_v72/<run>/summary.json`. For one source image there are therefore up to 9 candidate input sets; comparing the `overview.jpeg` of the same `<stem>` across runs is the quickest visual check.
+Resulting layout: `output/v72/<run>/<stem>_topk64_s{seed}_c{c}_a{a}_obj{obj}/` (e.g. `output/v72/c05/14_topk64_s1_c0.5_a0.7_obj0.5/`) with `input_*.jpeg`, `overview.jpeg`, `embeds.pt`, `groups.json`, plus `output/v72/<run>/summary.json`. For one source image there are therefore up to 9 candidate input sets; comparing the `overview.jpeg` of the same `<stem>` across runs is the quickest visual check.
 
 Notes:
 - The subject subspaces are cached in `text_cache/` and shared by all runs (the prior settings are the same), so only the first run pays for them.
@@ -406,7 +406,7 @@ In this analysis the closeness was approximated from `synthesize_v2.py` outputs;
 
 ```bash
 # default: class-dependent 2 x 2 grid for every input of every folder, 1024 px targets
-python synthesize_v2_1.py --root hf_generate_source --output-dir output/synth/v2_1_1024
+python synthesize_v2_1.py --root generate_source --output-dir output/synth/v2_1_1024
 
 # try the first 3 folders only
 python synthesize_v2_1.py --limit 3
@@ -429,7 +429,7 @@ Folders that already contain `synth_meta.json` are skipped unless `--overwrite` 
 
 | Argument | Default | Description |
 |---|---|---|
-| `--root` | `hf_generate_source` | Directory with decomposition folders (searched recursively for `embeds.pt` + `input_0.jpeg`), or one such folder |
+| `--root` | `generate_source` | Directory with decomposition folders (searched recursively for `embeds.pt` + `input_0.jpeg`), or one such folder |
 | `--output-dir` | `output/synth/v2_1` | Output root; the folder structure under `--root` is kept |
 | `--close-threshold` | 0.6 | An input is close if $\cos(f(\text{input}), f(\text{recon})) \ge$ this value; 0 = every input close, > 1 = every input far |
 | `--close-t` | `0,0.3` | Interpolation weights $t$ for close mains |
@@ -556,10 +556,10 @@ python select_targets.py --synth-root output/synth/v2_1_1024 --output-dir output
 
 | Pool | Inputs | Main | Target | Source |
 |---|---|---|---|---|
-| unspecified | `input_*.jpeg` of a decomposition folder | none | the original source image (path from `groups.json` → `image`, else `<stem>.*` in `--source-dir`) | every folder of `--decomp-root` (`output/decompose/hf_v72_final`), one sample each; `recon.jpeg` is not used |
+| unspecified | `input_*.jpeg` of a decomposition folder | none | the original source image (path from `groups.json` → `image`, else `<stem>.*` in `--source-dir`) | every folder of `--decomp-root` (`output/decompose/v72_final`), one sample each; `recon.jpeg` is not used |
 | designated | the same inputs | input $k$ | the files in `review/<folder>/main<k>/keep/`, one picked at random per draw | the review folders of `select_targets.py` |
 
-- **Input consistency.** The designated targets were synthesized on `hf_generate_source/`, a hand-picked copy of part of `hf_v72_final`. For every review folder the inputs are compared byte by byte with the folder of the same name in `--decomp-root`; if identical, the `hf_v72_final` paths are used (both pools share the cached latents), otherwise the inputs of the synthesis are kept and the folder is reported, because a target must come with the inputs it was synthesized from.
+- **Input consistency.** The designated targets were synthesized on `generate_source/`, a hand-picked copy of part of `v72_final`. For every review folder the inputs are compared byte by byte with the folder of the same name in `--decomp-root`; if identical, the `v72_final` paths are used (both pools share the cached latents), otherwise the inputs of the synthesis are kept and the folder is reported, because a target must come with the inputs it was synthesized from.
 - **Split by source image**, stratified: `--val-frac` (10 %) of the sources that have designated samples and 10 % of the others go to validation, so validation contains both pools.
 - **No ratio in the manifests.** The share of the two pools is decided during training by the pool schedule (see below); the manifests only record the pool of every sample, and the input order is shuffled at training time.
 
@@ -574,16 +574,16 @@ Output (`--output-dir`, default `data/multiref`): `train.jsonl`, `val.jsonl` (on
 ### Usage and parameters
 
 ```bash
-python build_dataset.py --decomp-root output/decompose/hf_v72_final \
-    --review-dir output/selection/review --source-dir hf_samples/sources --output-dir data/multiref
+python build_dataset.py --decomp-root output/decompose/v72_final \
+    --review-dir output/selection/review --source-dir samples/sources --output-dir data/multiref
 python cache_features.py --manifest-dir data/multiref --target-size 1024
 ```
 
 | Script | Argument | Default | Description |
 |---|---|---|---|
-| `build_dataset.py` | `--decomp-root` | `output/decompose/hf_v72_final` | Decomposition folders (unspecified pool) |
+| `build_dataset.py` | `--decomp-root` | `output/decompose/v72_final` | Decomposition folders (unspecified pool) |
 | | `--review-dir` | `output/selection/review` | Review folders (designated pool) |
-| | `--source-dir` | `hf_samples/sources` | Fallback location of the source images |
+| | `--source-dir` | `samples/sources` | Fallback location of the source images |
 | | `--val-frac`, `--seed` | 0.1, 0 | Validation fraction of the source images, split seed |
 | | `--min-inputs`, `--max-inputs` | 2, 4 | Allowed number of inputs |
 | `cache_features.py` | `--manifest-dir`, `--cache-dir` | `data/multiref`, `<manifest-dir>/cache` | Manifests and cache location |
@@ -681,7 +681,7 @@ What to check: the sample images approach the targets; for a designated folder t
 
 ```bash
 # base model (baseline)
-python generate_multi.py --folder output/decompose/hf_v72_final/<folder> --main 2
+python generate_multi.py --folder output/decompose/v72_final/<folder> --main 2
 
 # fine-tuned LoRA + role embedding (the same --role / --layout as in training)
 python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 \
@@ -693,7 +693,7 @@ python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 \
 ## Sanity checks (`check_multiref.py`)
 
 ```bash
-python check_multiref.py --folder output/decompose/hf_v72_final/<folder>   # all checks
+python check_multiref.py --folder output/decompose/v72_final/<folder>   # all checks
 python check_multiref.py --skip-model                                      # check 0 only
 ```
 
@@ -723,7 +723,7 @@ python fetch_hf_samples.py
 This streams the dataset, shuffles with a fixed seed, keeps 20 distinct sources, and writes:
 
 ```
-hf_samples/
+samples/
 ├── sources/        # source images to decompose
 ├── paper_inputs/   # paper's decomposition: <uid>_A.jpeg, <uid>_B.jpeg
 └── samples.json    # uid, sample_id, topk, frac (null if not encoded in the id)

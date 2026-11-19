@@ -1,4 +1,4 @@
-# fetch_hf_samples.py
+# fetch_samples.py
 import json
 import re
 from pathlib import Path
@@ -6,7 +6,7 @@ from pathlib import Path
 from datasets import load_dataset
 
 N = 20
-OUT = Path("hf_samples")
+OUT = Path("samples")
 (OUT / "sources").mkdir(parents=True, exist_ok=True)
 (OUT / "paper_inputs").mkdir(parents=True, exist_ok=True)
 

@@ -1,6 +1,6 @@
 """
 check_multiref.py -- sanity checks for multiref/conditioning.py (run once on the GPU server).
-Last modified: 2026-11-16
+Last modified: 2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
 
 Checks
 ------
@@ -21,7 +21,7 @@ Checks
 
 Usage
 -----
-    python check_multiref.py --folder hf_generate_source/<name>        # all checks
+    python check_multiref.py --folder generate_source/<name>        # all checks
     python check_multiref.py --skip-model                               # check 0 only
 """
 
