@@ -133,6 +133,10 @@ class MainRoleEmbedding(nn.Module):
         role.set_main(spans, main_pos)   # before each forward; main_pos None = no main image
         ...
         role.clear()
+
+    Diagnostics: every forward with a main image also accumulates the mean per-token norm of the
+    reference tokens (before E_main is added); pop_reference_norm() returns and resets it, so
+    the training log can report ||E_main|| relative to the tokens it is added to.
     """
 
     def __init__(self, dim: int):
@@ -140,6 +144,8 @@ class MainRoleEmbedding(nn.Module):
         self.e_main = nn.Parameter(torch.zeros(dim))  # zero init: no effect before training
         self._span = None  # (start, end, total) inside the reference block
         self._handle = None
+        self._norm_sum = None  # running sum (tensor, no host sync) of the reference token norm
+        self._norm_count = 0
 
     def attach(self, transformer):
         self.detach()
@@ -162,6 +168,14 @@ class MainRoleEmbedding(nn.Module):
     def clear(self):
         self._span = None
 
+    def pop_reference_norm(self):
+        """Mean per-token norm of the reference tokens since the last call (None if no forward)."""
+        if not self._norm_count:
+            return None
+        value = (self._norm_sum / self._norm_count).item()
+        self._norm_sum, self._norm_count = None, 0
+        return value
+
     def _hook(self, module, inputs, output):
         # output: [B, target tokens + reference tokens, D]; references are the last `total` tokens
         if self._span is None:
@@ -170,6 +184,10 @@ class MainRoleEmbedding(nn.Module):
         ref0 = output.shape[1] - total
         if ref0 < 0:
             raise RuntimeError(f"Sequence of length {output.shape[1]} is shorter than the reference block ({total}).")
+        with torch.no_grad():  # diagnostics only
+            norm = output[:, ref0:].detach().float().norm(dim=-1).mean()
+            self._norm_sum = norm if self._norm_sum is None else self._norm_sum + norm
+            self._norm_count += 1
         e = self.e_main.to(device=output.device, dtype=output.dtype)
         a, b = ref0 + start, ref0 + end
         # out-of-place, so gradients reach both the transformer input and E_main

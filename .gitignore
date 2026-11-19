@@ -110,6 +110,7 @@ datasets/
 *.tar
 *.tar.gz
 *.tgz
+previous_data/
 
 # Mac
 .DS_Store
@@ -124,10 +125,10 @@ datasets/
 
 # Local outputs and downloaded data
 hf_decomposed/
-hf_samples/
+samples/
 outputs*/
 test_decompose*/
-hf_generate_source/
+generate_source/
 
 # Local virtual environment
 seeds-env/
@@ -143,3 +144,4 @@ original_code/
 
 # Runs
 runs/
+

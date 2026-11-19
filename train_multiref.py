@@ -13,11 +13,22 @@ diffusers example train_dreambooth_lora_flux_kontext.py where possible:
     3. order:  references shuffled (multiref.prompts.arrange); prompt template of the main
                position; cached latents (references [16, 64, 64], target [16, 128, 128])
     4. noise:  sigma from the scheduler's training table (--weighting-scheme: uniform or
-               logit_normal), x_t = (1 - sigma) x_0 + sigma * noise, packed target tokens (t = 0)
+               logit_normal), x_t = (1 - sigma) x_0 + sigma * noise, packed target tokens (t = 0).
+               Designated samples can use their own density (--designated-sigma, see below)
     5. refs:   reference tokens and ids (multiref.conditioning.build_reference_tokens) appended
                after the target tokens; E_main hook set on the main reference (--role embed)
     6. loss:   transformer(timestep = sigma, guidance = --guidance-scale); MSE between the
                output of the target tokens and (noise - x_0)
+
+Sigma sampling of the designated samples
+    Which input is the main image decides the composition, and the composition is decided at
+    high noise; at low sigma the target is mostly visible in x_t and the main image hardly
+    matters. --designated-sigma logit_normal therefore draws the sigma of designated samples
+    directly as sigma = sigmoid(N(--designated-sigma-mean, --designated-sigma-std)), clamped to
+    the range of the sigma table (mean > 0 -> more HIGH-noise samples; mean 1, std 1: median
+    sigma 0.73). Unspecified samples keep --weighting-scheme. The loss weighting is unchanged.
+    Note: --weighting-scheme logit_normal indexes the DESCENDING sigma table with u, so there a
+    positive --logit-mean favours LOW sigma (as in the diffusers example).
 
 Trainable parameters: LoRA on the attention / feed-forward layers INSIDE the transformer
 blocks (the final output projection, also named proj_out, is excluded) and E_main.
@@ -26,9 +37,26 @@ LoRA parameters are kept in float32, the forward pass runs in bfloat16 autocast.
 Validation
     * every --val-every steps: loss on a fixed set of validation samples (fixed order, target,
       noise and sigmas 0.25 / 0.5 / 0.75), separately for the two pools
+    * every --gap-every steps (and at step 0): designation gap on fixed designated samples
+      (whole folders with the most mains first, at most --gap-samples). Per sample (main k,
+      target_k) and per sigma in --gap-sigmas, with the same noise and target:
+          L_right    main = k          L_wrong_j  main = j (every other input)
+          L_none     no main (base prompt, no E_main)
+      logged as  gap      = mean_j L_wrong_j - L_right   (> 0: the model uses the designation)
+                 gap_acc  = share with L_right < min_j L_wrong_j   (chance: 1 / n inputs)
+                 gap_none = L_none - L_right
+      overall and per sigma (gap_s0.9, gap_acc_s0.9, ...). A wrong main is designated the same
+      way as a right one: E_main on input j (embed), input j moved first (slot), "image j" in
+      the prompt (index). With --role embed the gap is exactly 0 at step 0 (E_main = 0 and the
+      prompt does not depend on the main), which checks the metric itself.
     * every --image-every steps (and at step 0): sample images for a few validation folders,
       preferably with >= 2 designated mains: no main, then each main, next to the targets
       -> <output-dir>/samples/step_XXXXXX.jpeg
+
+Training log (log.jsonl, every --log-every steps): loss per pool, grad_norm, p_unspec, lr,
+    sec_per_step, designated_share, mean sigma per pool (sigma_designated, sigma_unspecified)
+    and, with --role embed, e_main_norm, ref_token_norm (mean per-token norm of the reference
+    tokens) and e_main_ratio = e_main_norm / ref_token_norm.
 
 Checkpoints (every --save-every steps and at the end): <output-dir>/checkpoint-XXXXXX/
     lora/                      diffusers LoRA format (generate_multi.py --lora)
@@ -38,8 +66,9 @@ Checkpoints (every --save-every steps and at the end): <output-dir>/checkpoint-X
 Overfitting test
     --overfit N trains on a fixed subset of about N training samples (whole designated folders
     with their counterfactual mains, plus unspecified samples), one target per main, and uses
-    the same subset for validation. The loss should drop far below its start value and the
-    sample images should approach the targets.
+    the same subset for validation. The flow-matching loss drops only slowly even when samples
+    are memorized; judge by the sample images (they should approach the targets) and by the
+    designation gap (it should grow, mainly at high sigma).
 
 Usage
 -----
@@ -47,6 +76,11 @@ Usage
     python train_multiref.py --data-dir data/multiref --output-dir runs/overfit \\
         --overfit 8 --max-steps 1500 --warmup-steps 50 --grad-accum 1 \\
         --val-every 100 --image-every 250 --save-every 500
+
+    # overfitting test, main image moved first, more high-noise designated samples
+    python train_multiref.py --data-dir data/multiref --output-dir runs/overfit_slot_hs \
+        --overfit 8 --max-steps 1500 --warmup-steps 50 --grad-accum 1 --role slot \
+        --designated-sigma logit_normal --val-every 100 --image-every 250 --save-every 500
 
     # full run
     python train_multiref.py --data-dir data/multiref --output-dir runs/v1 --max-steps 10000
@@ -133,15 +167,26 @@ def parse_args():
     g.add_argument("--max-grad-norm", type=float, default=1.0)
     g.add_argument("--weighting-scheme", choices=["none", "logit_normal", "mode", "cosmap", "sigma_sqrt"],
                    default="none", help="Timestep density / loss weighting (none = uniform sigma)")
-    g.add_argument("--logit-mean", type=float, default=0.0)
+    g.add_argument("--logit-mean", type=float, default=0.0,
+                   help="logit_normal mean of u; u indexes the DESCENDING sigma table, so > 0 favours LOW sigma")
     g.add_argument("--logit-std", type=float, default=1.0)
     g.add_argument("--mode-scale", type=float, default=1.29)
+    g.add_argument("--designated-sigma", choices=["same", "logit_normal"], default="same",
+                   help="Sigma density of designated samples: same as unspecified, or "
+                        "sigma = sigmoid(N(mean, std)) (mean > 0 favours HIGH sigma)")
+    g.add_argument("--designated-sigma-mean", type=float, default=1.0)
+    g.add_argument("--designated-sigma-std", type=float, default=1.0)
     g.add_argument("--seed", type=int, default=0)
 
     g = p.add_argument_group("validation and checkpoints")
     g.add_argument("--log-every", type=int, default=10)
     g.add_argument("--val-every", type=int, default=500, help="Validation loss interval (0 = off)")
     g.add_argument("--val-samples", type=int, default=16, help="Validation samples used for the loss")
+    g.add_argument("--gap-every", type=int, default=None,
+                   help="Designation-gap interval (default: --val-every; 0 = off)")
+    g.add_argument("--gap-samples", type=int, default=8, help="Designated samples used for the gap")
+    g.add_argument("--gap-sigmas", default="0.9,0.75,0.5,0.25", help="Sigmas of the designation gap")
+    g.add_argument("--gap-noises", type=int, default=1, help="Noise draws per sigma for the gap")
     g.add_argument("--image-every", type=int, default=1000, help="Sample-image interval (0 = off)")
     g.add_argument("--image-folders", type=int, default=3, help="Validation folders shown in the sample images")
     g.add_argument("--image-steps", type=int, default=28, help="Denoising steps of the sample images")
@@ -149,7 +194,10 @@ def parse_args():
     g.add_argument("--save-every", type=int, default=1000)
     g.add_argument("--resume", type=Path, default=None, help="checkpoint-XXXXXX folder to resume from")
     g.add_argument("--tensorboard", action="store_true", help="Also log to TensorBoard (<output-dir>/tb)")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.gap_every is None:
+        args.gap_every = args.val_every
+    return args
 
 
 # --------------------------------------------------------------------------------------
@@ -203,7 +251,12 @@ def sigma_table(args):
     return sched.sigmas.clone().float()
 
 
-def sample_sigma(args, sigmas, generator):
+def sample_sigma(args, sigmas, generator, pool="unspecified"):
+    """Training sigma ([1] tensor) of one sample of the given pool."""
+    if pool == "designated" and args.designated_sigma == "logit_normal":
+        # drawn directly in sigma space: a positive mean means more high-noise samples
+        z = torch.randn(1, generator=generator) * args.designated_sigma_std + args.designated_sigma_mean
+        return torch.sigmoid(z).clamp(float(sigmas.min()), float(sigmas.max()))
     u = compute_density_for_timestep_sampling(weighting_scheme=args.weighting_scheme, batch_size=1,
                                               logit_mean=args.logit_mean, logit_std=args.logit_std,
                                               mode_scale=args.mode_scale, generator=generator)
@@ -284,6 +337,74 @@ def validation_loss(transformer, role, val_set, args):
     out = {f"val_loss_{k}": sum(v) / len(v) for k, v in losses.items()}
     all_losses = [x for v in losses.values() for x in v]
     out["val_loss"] = sum(all_losses) / max(1, len(all_losses))
+    return out
+
+
+def parse_sigmas(text):
+    return [float(x) for x in text.split(",") if x.strip()]
+
+
+def designation_gap_set(rows, store, args):
+    """Fixed designated samples for the designation gap, each with all its designations.
+
+    Whole folders (all their mains) first, most mains first, at most --gap-samples rows. For each
+    row the references are shuffled once (fixed seed) and the same order is used for every
+    designation, so only the designation differs (slot mode still moves the designated input
+    first). Noise is drawn once per row and sigma.
+    """
+    by_folder = defaultdict(list)
+    for r in rows:
+        if r["pool"] == "designated":
+            by_folder[r["folder"]].append(r)
+    picked = []
+    for folder in sorted(by_folder, key=lambda f: (-len(by_folder[f]), f)):
+        picked += sorted(by_folder[folder], key=lambda r: r["main"])
+        if len(picked) >= args.gap_samples:
+            break
+    picked = picked[: args.gap_samples]
+
+    sigmas = parse_sigmas(args.gap_sigmas)
+    out = []
+    for i, row in enumerate(picked):
+        target = row["targets"][0]
+
+        def example(main):
+            # a fresh RNG with the same seed -> the same shuffle for every designation
+            return make_example(dict(row, main=main), target, store, args.role, random.Random(30_000 + i),
+                                shuffle=not args.no_shuffle)
+
+        right = example(row["main"])
+        wrong = [example(j) for j in range(len(row["inputs"])) if j != row["main"]]
+        gen = torch.Generator().manual_seed(40_000 + i)
+        shape = right["target"].unsqueeze(0).shape
+        noises = {sig: [torch.randn(shape, generator=gen) for _ in range(args.gap_noises)] for sig in sigmas}
+        out.append({"id": row["id"], "right": right, "wrong": wrong, "none": example(None), "noises": noises})
+    return out
+
+
+@torch.no_grad()
+def designation_gap(transformer, role, gap_set, args):
+    """Loss differences between right, wrong and no designation (see the module docstring)."""
+    transformer.eval()
+    per_sigma = defaultdict(lambda: defaultdict(list))
+    for item in gap_set:
+        for sig, noises in item["noises"].items():
+            s = torch.tensor([sig])
+            for noise in noises:
+                l_right = forward_loss(transformer, role, item["right"], s, noise, args).item()
+                l_wrong = [forward_loss(transformer, role, ex, s, noise, args).item() for ex in item["wrong"]]
+                l_none = forward_loss(transformer, role, item["none"], s, noise, args).item()
+                per_sigma[sig]["gap"].append(sum(l_wrong) / len(l_wrong) - l_right)
+                per_sigma[sig]["gap_acc"].append(float(l_right < min(l_wrong)))
+                per_sigma[sig]["gap_none"].append(l_none - l_right)
+    transformer.train()
+    out = {}
+    for metric in ("gap", "gap_acc", "gap_none"):
+        values = [v for sig in per_sigma for v in per_sigma[sig][metric]]
+        out[metric] = sum(values) / max(1, len(values))
+        for sig in per_sigma:
+            v = per_sigma[sig][metric]
+            out[f"{metric}_s{sig:g}"] = sum(v) / len(v)
     return out
 
 
@@ -466,6 +587,14 @@ def main():
         vae=vae, text_encoder=None, tokenizer=None, text_encoder_2=None, tokenizer_2=None, transformer=transformer)
     pipe.set_progress_bar_config(disable=True)
     val_set = fixed_val_set(val_rows, store, args) if args.val_every else []
+    gap_set = designation_gap_set(val_rows, store, args) if args.gap_every else []
+    if args.gap_every and not gap_set:
+        print("[warn] no designated validation samples: designation gap disabled")
+    elif gap_set:
+        n_cond = sum(len(item["wrong"]) + 2 for item in gap_set)  # right + wrong + none
+        n_fwd = n_cond * len(parse_sigmas(args.gap_sigmas)) * args.gap_noises
+        print(f"designation gap: {len(gap_set)} samples ({', '.join(item['id'] for item in gap_set)}), "
+              f"{n_fwd} forward passes per evaluation")
     folders = image_folders(val_rows, args.image_folders) if args.image_every else []
 
     writer = None
@@ -490,6 +619,10 @@ def main():
         rec = {"step": 0, **validation_loss(transformer, role, val_set, args)}
         log(rec)
         print("step 0 " + " ".join(f"{k} {v:.4f}" for k, v in rec.items() if k != "step"))
+    if step == 0 and gap_set:
+        rec = {"step": 0, **designation_gap(transformer, role, gap_set, args)}
+        log(rec)
+        print("step 0 " + " ".join(f"{k} {v:.4f}" for k, v in rec.items() if k != "step"))
 
     # ---------------- training ----------------
     transformer.train()
@@ -500,7 +633,9 @@ def main():
         for _ in range(args.grad_accum):
             row, target = sampler.sample(p_unspec)
             ex = make_example(row, target, store, args.role, data_rng, shuffle=not args.no_shuffle)
-            loss = forward_loss(transformer, role, ex, sample_sigma(args, sigmas, sigma_gen), None, args)
+            sigma = sample_sigma(args, sigmas, sigma_gen, ex["pool"])
+            window[f"sigma_{ex['pool']}"].append(float(sigma))
+            loss = forward_loss(transformer, role, ex, sigma, None, args)
             (loss / args.grad_accum).backward()
             window["loss"].append(loss.item())
             window[f"loss_{ex['pool']}"].append(loss.item())
@@ -518,6 +653,10 @@ def main():
                    "sec_per_step": (time.time() - t0) / args.log_every}
             if role is not None:
                 rec["e_main_norm"] = role.e_main.detach().norm().item()
+                ref_norm = role.pop_reference_norm()  # None if no designated forward since the last log
+                if ref_norm:
+                    rec["ref_token_norm"] = ref_norm
+                    rec["e_main_ratio"] = rec["e_main_norm"] / ref_norm
             rec["designated_share"] = rec.pop("designated")
             log(rec)
             print(" ".join([f"step {step}"] + [f"{k} {v:.4g}" for k, v in rec.items() if k != "step"]))
@@ -525,6 +664,10 @@ def main():
             t0 = time.time()
         if val_set and step % args.val_every == 0:
             rec = {"step": step, **validation_loss(transformer, role, val_set, args)}
+            log(rec)
+            print(f"step {step} " + " ".join(f"{k} {v:.4f}" for k, v in rec.items() if k != "step"))
+        if gap_set and step % args.gap_every == 0:
+            rec = {"step": step, **designation_gap(transformer, role, gap_set, args)}
             log(rec)
             print(f"step {step} " + " ".join(f"{k} {v:.4f}" for k, v in rec.items() if k != "step"))
         if folders and step % args.image_every == 0:
