@@ -1,6 +1,7 @@
 """
 generate_multi.py -- combine 2-4 reference images with FLUX.1 Kontext, optionally with a main image.
-Last modified: 2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
+Last modified: 2026-11-19 (role mode "tid", --main-t)
+               2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
 
 Inputs are given either as a list of images (--images) or as a decomposition folder
 (--folder, uses its input_0.jpeg, input_1.jpeg, ...). --main k (1-based, in the given order)
@@ -12,6 +13,8 @@ How the main image is designated (--role, must match the training run):
            differs between modes)
     slot   the main image is moved to the first position
     index  the main image is named in the prompt ("image k")
+    tid    the main image keeps its position, its tokens get position id t = --main-t
+           (2 by default, as in training) instead of 1
 
 The prompt is always one of the fixed templates in multiref/prompts.py.
 
@@ -36,7 +39,7 @@ from pathlib import Path
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-from multiref.conditioning import LAYOUTS, MainRoleEmbedding, MultiRefKontextPipeline, load_rgb
+from multiref.conditioning import LAYOUTS, MAIN_T, MainRoleEmbedding, MultiRefKontextPipeline, load_rgb
 from multiref.data import list_inputs
 from multiref.prompts import ROLE_MODES
 
@@ -49,6 +52,7 @@ def parse_args():
     p.add_argument("--main", type=int, default=None, help="Main image, 1-based in the given order (default: none)")
     p.add_argument("--role", choices=ROLE_MODES, default="embed", help="How the main image is designated")
     p.add_argument("--layout", choices=LAYOUTS, default="canvas", help="Position ids of the references")
+    p.add_argument("--main-t", type=float, default=MAIN_T, help="t id of the main image with --role tid")
     p.add_argument("--base-model", default="black-forest-labs/FLUX.1-Kontext-dev")
     p.add_argument("--lora", default=None, help="LoRA weights (local path or Hugging Face repo)")
     p.add_argument("--role-embedding", type=Path, default=None, help="role_embedding.safetensors (role 'embed')")
@@ -137,7 +141,7 @@ def main():
         generator = torch.Generator(device="cuda").manual_seed(seed)
         out, info = pipe.generate_multi(
             images, main=main_idx, role_mode=args.role, layout=args.layout, role_embedding=role,
-            ref_size=args.ref_size, height=args.size, width=args.size, prompt=args.prompt,
+            ref_size=args.ref_size, height=args.size, width=args.size, prompt=args.prompt, main_t=args.main_t,
             num_inference_steps=args.steps, guidance_scale=args.guidance_scale, generator=generator,
         )
         result = out.images[0]
@@ -149,7 +153,8 @@ def main():
     if info is not None:
         with open(args.output_dir / f"{tag}.json", "w") as f:
             json.dump({"inputs": [str(p) for p in paths], "main": args.main, "role": args.role,
-                       "layout": args.layout, "lora": args.lora,
+                       "layout": args.layout, "main_t": args.main_t if args.role == "tid" else None,
+                       "lora": args.lora,
                        "role_embedding": str(args.role_embedding) if args.role_embedding else None,
                        **info}, f, indent=2)
 

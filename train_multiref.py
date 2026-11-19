@@ -1,6 +1,6 @@
 """
 train_multiref.py -- LoRA (+ main-image role embedding) fine-tuning of FLUX.1 Kontext dev with 2-4 references.
-Last modified: 2026-11-17
+Last modified: 2026-11-19 (role mode "tid": main image marked by position id t = --main-t)
 
 Data: manifests from build_dataset.py (train.jsonl, val.jsonl) and the cache from
 cache_features.py (VAE latents + prompt embeddings). Only the transformer (and, for the sample
@@ -16,7 +16,16 @@ diffusers example train_dreambooth_lora_flux_kontext.py where possible:
                logit_normal), x_t = (1 - sigma) x_0 + sigma * noise, packed target tokens (t = 0).
                Designated samples can use their own density (--designated-sigma, see below)
     5. refs:   reference tokens and ids (multiref.conditioning.build_reference_tokens) appended
-               after the target tokens; E_main hook set on the main reference (--role embed)
+               after the target tokens; E_main hook set on the main reference (--role embed);
+               the main reference gets t = --main-t instead of 1 (--role tid)
+
+Role modes (--role; how the main image is designated, see multiref/prompts.py)
+    embed  learnable E_main added to the main image's tokens; order unchanged
+    slot   main image moved to the first position (learns "first input = main image" even
+           without a designation: check with eval_multiref.py)
+    index  main image named in the prompt ("image k")
+    tid    main image keeps its position, its tokens get position id t = --main-t (2) instead
+           of 1; without a main image all references have t = 1 (canvas layout only)
     6. loss:   transformer(timestep = sigma, guidance = --guidance-scale); MSE between the
                output of the target tokens and (noise - x_0)
 
@@ -47,7 +56,7 @@ Validation
                  gap_none = L_none - L_right
       overall and per sigma (gap_s0.9, gap_acc_s0.9, ...). A wrong main is designated the same
       way as a right one: E_main on input j (embed), input j moved first (slot), "image j" in
-      the prompt (index). With --role embed the gap is exactly 0 at step 0 (E_main = 0 and the
+      the prompt (index), t = --main-t on input j (tid). With --role embed the gap is exactly 0 at step 0 (E_main = 0 and the
       prompt does not depend on the main), which checks the metric itself.
     * every --image-every steps (and at step 0): sample images for a few validation folders,
       preferably with >= 2 designated mains: no main, then each main, next to the targets
@@ -78,9 +87,15 @@ Usage
         --val-every 100 --image-every 250 --save-every 500
 
     # overfitting test, main image moved first, more high-noise designated samples
-    python train_multiref.py --data-dir data/multiref --output-dir runs/overfit_slot_hs \
-        --overfit 8 --max-steps 1500 --warmup-steps 50 --grad-accum 1 --role slot \
+    python train_multiref.py --data-dir data/multiref --output-dir runs/overfit_slot_hs \\
+        --overfit 8 --max-steps 1500 --warmup-steps 50 --grad-accum 1 --role slot \\
         --designated-sigma logit_normal --val-every 100 --image-every 250 --save-every 500
+
+    # overfitting test, main image marked by position id t = 2 (same settings as overfit_slot_hs_long)
+    python train_multiref.py --data-dir data/multiref --output-dir runs/overfit_tid_hs_long \\
+        --overfit 8 --max-steps 5000 --warmup-steps 50 --grad-accum 1 --role tid --lr 3e-4 \\
+        --unspec-schedule 0.3 --designated-sigma logit_normal \\
+        --val-every 250 --image-every 500 --save-every 1000
 
     # full run
     python train_multiref.py --data-dir data/multiref --output-dir runs/v1 --max-steps 10000
@@ -105,7 +120,15 @@ from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
 from PIL import Image, ImageDraw, ImageFont
 
-from multiref.conditioning import LAYOUTS, MainRoleEmbedding, MultiRefKontextPipeline, build_reference_tokens, pack_latents
+from multiref.conditioning import (
+    LAYOUTS,
+    MAIN_T,
+    MainRoleEmbedding,
+    MultiRefKontextPipeline,
+    build_reference_tokens,
+    marker_pos,
+    pack_latents,
+)
 from multiref.prompts import ROLE_MODES, arrange, prompt_key
 from multiref.train_data import (
     LatentStore,
@@ -150,6 +173,8 @@ def parse_args():
     g.add_argument("--base-model", default="black-forest-labs/FLUX.1-Kontext-dev")
     g.add_argument("--role", choices=ROLE_MODES, default="embed", help="How the main image is designated")
     g.add_argument("--layout", choices=LAYOUTS, default="canvas", help="Position ids of the references")
+    g.add_argument("--main-t", type=float, default=MAIN_T,
+                   help="Position id t of the main reference with --role tid (the other references have t = 1)")
     g.add_argument("--lora-rank", type=int, default=32)
     g.add_argument("--lora-alpha", type=int, default=None, help="Default: equal to the rank")
     g.add_argument("--lora-layers", default=",".join(LORA_SUFFIXES),
@@ -280,7 +305,9 @@ def forward_loss(transformer, role, ex, sigma, noise, args):
     tgt_tokens = pack_latents(xt)
     tgt_ids = FluxKontextPipeline._prepare_latent_image_ids(1, h // 2, w // 2, DEVICE, DTYPE)
     refs = [r.unsqueeze(0).to(DEVICE, DTYPE) for r in ex["refs"]]
-    ref_tokens, ref_ids, spans = build_reference_tokens(refs, args.layout, (h // 2, w // 2))
+    ref_tokens, ref_ids, spans = build_reference_tokens(refs, args.layout, (h // 2, w // 2),
+                                                        main_pos=marker_pos(args.role, ex["main_pos"]),
+                                                        main_t=getattr(args, "main_t", MAIN_T))
     hidden = torch.cat([tgt_tokens, ref_tokens.to(DEVICE, DTYPE)], dim=1)
     img_ids = torch.cat([tgt_ids, ref_ids.to(DEVICE, DTYPE)], dim=0)
 
@@ -435,7 +462,7 @@ def sample_images(pipe, role, folders, store, args, step):
             pr = store.prompt(prompt_key(main_pos, args.role))
             with torch.autocast("cuda", dtype=DTYPE):
                 out = pipe.generate_from_latents(
-                    refs, main_pos, args.role, args.layout, role, height=size, width=size,
+                    refs, main_pos, args.role, args.layout, role, height=size, width=size, main_t=args.main_t,
                     prompt_embeds=pr["prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
                     pooled_prompt_embeds=pr["pooled_prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
                     num_inference_steps=args.image_steps, guidance_scale=args.guidance_scale,
@@ -532,6 +559,8 @@ def main():
     cache_dir = args.cache_dir or args.data_dir / "cache"
 
     # ---------------- data ----------------
+    if args.role == "tid" and args.layout != "canvas":
+        raise ValueError("--role tid needs --layout canvas")
     train_rows = load_rows(args.data_dir, "train")
     val_rows = load_rows(args.data_dir, "val")
     if args.overfit:

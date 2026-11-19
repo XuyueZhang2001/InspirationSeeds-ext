@@ -15,6 +15,12 @@ Position ids (t, h, w) of the reference tokens; the generated image always has t
     per_t   reference k gets t = k + 1; h and w are scaled so that every reference spans
             the whole token grid of the generated image (ablation).
 
+Main image (role mode "tid", canvas layout only)
+    The main reference keeps its place on the canvas (same h, w ids) but gets t = main_t
+    (MAIN_T = 2 by default) instead of 1. The base model already distinguishes position ids,
+    so the marker is visible from the first step, and without a main image all references
+    have t = 1: no position is special, unlike role mode "slot" (main image moved first).
+
 Main image (role mode "embed")
     MainRoleEmbedding adds a learnable vector E_main to every token of the main reference
     right after the patch embedding, through a forward hook on transformer.x_embedder.
@@ -40,6 +46,12 @@ from safetensors.torch import load_file, save_file
 from .prompts import ROLE_MODES, arrange
 
 LAYOUTS = ("canvas", "per_t")
+MAIN_T = 2.0  # t id of the main reference in role mode "tid" (the other references have t = 1)
+
+
+def marker_pos(role_mode: str, main_pos):
+    """Position of the reference that gets the t marker: main_pos for role mode "tid", else None."""
+    return main_pos if role_mode == "tid" else None
 
 
 # --------------------------------------------------------------------------------------
@@ -89,12 +101,15 @@ def make_ids(h2: int, w2: int, t: float, h_off: float = 0.0, w_off: float = 0.0,
     return ids.reshape(h2 * w2, 3)
 
 
-def build_reference_tokens(latents_list, layout: str = "canvas", target_hw=None):
+def build_reference_tokens(latents_list, layout: str = "canvas", target_hw=None, main_pos=None,
+                           main_t: float = MAIN_T):
     """Packed tokens, ids and token slices of the references (in model order).
 
     latents_list: list of [B, 16, h, w] latents (same B)
     layout:       "canvas" or "per_t"
     target_hw:    (h2, w2) token grid of the generated image, required for "per_t"
+    main_pos:     reference (model order) that gets t = main_t instead of 1 (role mode "tid",
+                  see marker_pos); None = no marker. Canvas layout only; h, w ids are unchanged.
 
     Returns (tokens [B, L, 64], ids [L, 3], spans) where spans[k] = (start, end) is the
     slice of reference k inside the reference block (0 = first reference token).
@@ -103,6 +118,10 @@ def build_reference_tokens(latents_list, layout: str = "canvas", target_hw=None)
         raise ValueError(f"Unknown layout {layout!r}; expected one of {LAYOUTS}")
     if layout == "per_t" and target_hw is None:
         raise ValueError("layout 'per_t' needs target_hw")
+    if main_pos is not None and layout != "canvas":
+        raise ValueError("a t marker on the main reference (role mode 'tid') needs layout 'canvas'")
+    if main_pos is not None and not 0 <= main_pos < len(latents_list):
+        raise ValueError(f"main_pos {main_pos} out of range for {len(latents_list)} references")
     tokens, ids, spans = [], [], []
     start, w_offset = 0, 0
     for k, lat in enumerate(latents_list):
@@ -110,7 +129,7 @@ def build_reference_tokens(latents_list, layout: str = "canvas", target_hw=None)
         h2, w2 = h // 2, w // 2
         tok = pack_latents(lat)
         if layout == "canvas":
-            i = make_ids(h2, w2, t=1, w_off=w_offset)
+            i = make_ids(h2, w2, t=main_t if k == main_pos else 1, w_off=w_offset)
             w_offset += w2
         else:
             th, tw = target_hw
@@ -236,13 +255,16 @@ class MultiRefKontextPipeline(FluxKontextPipeline):
     @torch.no_grad()
     def generate_multi(self, references, main=None, role_mode: str = "embed", layout: str = "canvas",
                        role_embedding: MainRoleEmbedding | None = None, ref_size: int = 512,
-                       height: int = 1024, width: int = 1024, prompt: str | None = None, **kwargs):
+                       height: int = 1024, width: int = 1024, prompt: str | None = None,
+                       main_t: float = MAIN_T, **kwargs):
         """Generate from 2-4 reference images.
 
         references:     list of PIL images, in the user's order
         main:           index of the main image in that order (0-based), or None
-        role_mode:      "embed" (E_main on the main image), "slot" (main moved first), "index" (named in prompt)
+        role_mode:      "embed" (E_main on the main image), "slot" (main moved first), "index" (named in prompt),
+                        "tid" (main image gets position id t = main_t)
         role_embedding: MainRoleEmbedding attached to self.transformer (used with role_mode "embed")
+        main_t:         t id of the main image with role_mode "tid"
         prompt:         override the template prompt (normally left None)
         kwargs:         passed to the pipeline (num_inference_steps, guidance_scale, generator, ...)
 
@@ -254,23 +276,25 @@ class MultiRefKontextPipeline(FluxKontextPipeline):
         latents = self.encode_references([references[i] for i in order], ref_size)
         prompt = prompt or template
         out = self.generate_from_latents(latents, main_pos, role_mode, layout, role_embedding,
-                                         height=height, width=width, prompt=prompt, **kwargs)
+                                         height=height, width=width, prompt=prompt, main_t=main_t, **kwargs)
         return out, {"order": order, "main_pos": main_pos, "prompt": prompt}
 
     @torch.no_grad()
     def generate_from_latents(self, ref_latents, main_pos=None, role_mode: str = "embed", layout: str = "canvas",
                               role_embedding: MainRoleEmbedding | None = None, height: int = 1024, width: int = 1024,
-                              **kwargs):
+                              main_t: float = MAIN_T, **kwargs):
         """Generate from reference latents that are already in model order (e.g. cached latents).
 
         ref_latents: list of [1, 16, h, w] normalized VAE latents, in model order
         main_pos:    position of the main reference in that order, or None
+        main_t:      t id of the main reference with role_mode "tid"
         kwargs:      passed to the pipeline: prompt or prompt_embeds + pooled_prompt_embeds, steps, guidance, ...
                      (the prompt must match role_mode and main_pos, see multiref.prompts)
         """
         multiple = self.vae_scale_factor * 2
         target_hw = (height // multiple, width // multiple)
-        tokens, ids, spans = build_reference_tokens(ref_latents, layout, target_hw)
+        tokens, ids, spans = build_reference_tokens(ref_latents, layout, target_hw,
+                                                    main_pos=marker_pos(role_mode, main_pos), main_t=main_t)
         if role_embedding is not None:
             role_embedding.set_main(spans, main_pos if role_mode == "embed" else None)
         self._multiref = (tokens, ids)

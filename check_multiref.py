@@ -1,11 +1,14 @@
 """
 check_multiref.py -- sanity checks for multiref/conditioning.py (run once on the GPU server).
-Last modified: 2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
+Last modified: 2026-11-19 (check 0b: t marker of role mode "tid"; baseline rows per role mode, --main-t)
+               2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
 
 Checks
 ------
 0. ids / tokens (no model weights): the "canvas" reference tokens and ids are the same set as
    concatenating the latents along the width and packing them like the stock pipeline.
+0b. t marker (no model weights): with a main reference (role mode "tid"), tokens, spans and
+   (h, w) ids are unchanged; only the t id of the main reference's tokens becomes --main-t.
 1. One reference: MultiRefKontextPipeline.generate_multi gives the SAME image as the stock
    FluxKontextPipeline call with that image (reference and output at --size, 1024 by default;
    the stock call uses _auto_resize=False, so the same check also works for other sizes).
@@ -15,14 +18,21 @@ Checks
 3. Role embedding with E_main = 0: identical output with and without the hook. Expected: 0.
 4. Role embedding slice: with a random E_main, only the tokens of the main reference change
    at the output of transformer.x_embedder.
-5. Baseline images of the base model (no LoRA): no main image, each input as main (role
-   "embed" with E_main = 0, so only the prompt changes), and the "per_t" layout.
-   Saved to --output-dir/baseline_<folder>.jpeg for a visual check.
+5. Baseline images of the base model (no LoRA), saved to --output-dir/baseline_<folder>.jpeg:
+     first row:  no main image; the "marked image" prompt without any marker (role "embed"
+                 with E_main = 0: the same for every main, so shown once); the "per_t" layout
+     then one row per role mode in --baseline-roles (default: tid), each input as main:
+       tid    input k gets t = --main-t. The base model should still use all references (no
+              image dropped, no unrelated object); a reaction to the marker is welcome but
+              not needed, since training teaches what it means
+       slot   input k moved first, "first image" prompt
+       index  "image k" in the prompt
 
 Usage
 -----
     python check_multiref.py --folder generate_source/<name>        # all checks
-    python check_multiref.py --skip-model                               # check 0 only
+    python check_multiref.py --skip-model                               # checks 0 and 0b only
+    python check_multiref.py --folder generate_source/<name> --baseline-roles tid,slot --main-t 3
 """
 
 import argparse
@@ -33,7 +43,7 @@ import torch
 from diffusers import FluxKontextPipeline
 from PIL import Image, ImageDraw, ImageFont
 
-from multiref.conditioning import MainRoleEmbedding, MultiRefKontextPipeline, build_reference_tokens, load_rgb
+from multiref.conditioning import MAIN_T, MainRoleEmbedding, MultiRefKontextPipeline, build_reference_tokens, load_rgb
 from multiref.data import list_inputs
 from multiref.prompts import render_prompt
 
@@ -60,6 +70,22 @@ def check_ids_tokens():
     spans_ok = spans == [(0, 1024), (1024, 2048), (2048, 3072)]
     return report("0 canvas ids/tokens == stock packing", same_ids and same_tok and spans_ok,
                   f"ids {same_ids}, tokens {same_tok}, spans {spans}")
+
+
+def check_t_marker(main_t):
+    """Check 0b: the "tid" marker only changes the t id of the main reference's tokens."""
+    torch.manual_seed(0)
+    lat = [torch.randn(1, 16, 64, 64) for _ in range(3)]
+    tok, ids, spans = build_reference_tokens(lat, "canvas")
+    main = 1
+    tok_m, ids_m, spans_m = build_reference_tokens(lat, "canvas", main_pos=main, main_t=main_t)
+    a, b = spans[main]
+    expected = ids.clone()
+    expected[a:b, 0] = main_t
+    ok = torch.equal(tok, tok_m) and spans == spans_m and torch.equal(ids_m, expected)
+    t_values = sorted(set(ids_m[:, 0].tolist()))
+    return report(f"0b t marker: only the main reference gets t = {main_t:g}", ok,
+                  f"tokens equal {torch.equal(tok, tok_m)}, spans equal {spans == spans_m}, t values {t_values}")
 
 
 def max_diff(a, b):
@@ -137,34 +163,41 @@ def run_model_checks(args):
                           f"expected first {seq - n_ref + main_idx * 1024}"))
 
     # 5. baseline images of the base model
-    rows = []
-    settings = [("no main", None, "canvas")] + [(f"main {k + 1}", k, "canvas") for k in range(len(images))]
-    settings.append(("no main, per_t", None, "per_t"))
-    for label, main, layout in settings:
-        out, info = pipe.generate_multi(images, main=main, role_mode="embed", layout=layout, height=args.size,
-                                        width=args.size, num_inference_steps=args.baseline_steps,
-                                        guidance_scale=args.guidance_scale, generator=gen())
-        rows.append((label, out.images[0]))
+    def baseline(main, role_mode, layout="canvas"):
+        out, _ = pipe.generate_multi(images, main=main, role_mode=role_mode, layout=layout, height=args.size,
+                                     width=args.size, num_inference_steps=args.baseline_steps,
+                                     guidance_scale=args.guidance_scale, main_t=args.main_t, generator=gen())
+        return out.images[0]
+
+    rows = [[("no main", baseline(None, "embed")),
+             ("marked prompt, no marker", baseline(0, "embed")),
+             ("no main, per_t", baseline(None, "embed", "per_t"))]]
+    labels = {"tid": "t={t:g} on image {k}", "slot": "image {k} first", "index": "'image {k}' in prompt"}
+    for mode in args.baseline_roles:
+        rows.append([(f"{mode}: " + labels[mode].format(t=args.main_t, k=k + 1), baseline(k, mode))
+                     for k in range(len(images))])
+        print(f"baseline row: {mode}")
     save_baseline(images, rows, args.output_dir / f"baseline_{args.folder.name}.jpeg")
     return results
 
 
 def save_baseline(inputs, rows, path, tile=256):
+    """Inputs in the first row, then one row per list of (label, image)."""
     try:
         font = ImageFont.load_default(size=14)
     except TypeError:  # older Pillow
         font = ImageFont.load_default()
     gap, cap = 8, 22
-    n = max(len(inputs), len(rows))
-    canvas = Image.new("RGB", (gap + n * (tile + gap), 2 * (tile + cap + gap) + gap), "white")
+    grid = [[(f"image {i + 1}", im) for i, im in enumerate(inputs)]] + rows
+    n = max(len(r) for r in grid)
+    canvas = Image.new("RGB", (gap + n * (tile + gap), gap + len(grid) * (tile + cap + gap)), "white")
     draw = ImageDraw.Draw(canvas)
-    for i, im in enumerate(inputs):
-        canvas.paste(im.resize((tile, tile)), (gap + i * (tile + gap), gap))
-        draw.text((gap + i * (tile + gap) + 2, gap + tile + 3), f"image {i + 1}", fill="black", font=font)
-    y = gap + tile + cap + gap
-    for i, (label, im) in enumerate(rows):
-        canvas.paste(im.resize((tile, tile)), (gap + i * (tile + gap), y))
-        draw.text((gap + i * (tile + gap) + 2, y + tile + 3), label, fill="black", font=font)
+    for r, row in enumerate(grid):
+        y = gap + r * (tile + cap + gap)
+        for i, (label, im) in enumerate(row):
+            x = gap + i * (tile + gap)
+            canvas.paste(im.resize((tile, tile)), (x, y))
+            draw.text((x + 2, y + tile + 3), label, fill="black", font=font)
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path, quality=92)
     print(f"baseline images: {path}")
@@ -174,7 +207,11 @@ def main():
     p = argparse.ArgumentParser(description="Sanity checks for multiref/conditioning.py")
     p.add_argument("--folder", type=Path, help="Decomposition folder with 2-4 input images (needed for checks 1-5)")
     p.add_argument("--base-model", default="black-forest-labs/FLUX.1-Kontext-dev")
-    p.add_argument("--skip-model", action="store_true", help="Only run check 0 (no model weights)")
+    p.add_argument("--skip-model", action="store_true", help="Only run checks 0 and 0b (no model weights)")
+    p.add_argument("--baseline-roles", default="tid",
+                   type=lambda x: [m for m in x.split(",") if m.strip()],
+                   help="Comma-separated role modes with one baseline row each: tid, slot, index ('' = none)")
+    p.add_argument("--main-t", type=float, default=MAIN_T, help="t id of the main image in the 'tid' rows")
     p.add_argument("--steps", type=int, default=4, help="Denoising steps for checks 1-3")
     p.add_argument("--baseline-steps", type=int, default=28, help="Denoising steps for the baseline images")
     p.add_argument("--size", type=int, default=1024, help="Output size (training target size)")
@@ -183,7 +220,10 @@ def main():
     p.add_argument("--output-dir", type=Path, default=Path("outputs/check_multiref"))
     args = p.parse_args()
 
-    results = [check_ids_tokens()]
+    bad = [m for m in args.baseline_roles if m not in ("tid", "slot", "index")]
+    if bad:
+        p.error(f"--baseline-roles: unknown role mode(s) {bad}; use tid, slot, index")
+    results = [check_ids_tokens(), check_t_marker(args.main_t)]
     if not args.skip_model:
         if args.folder is None:
             p.error("--folder is required unless --skip-model is given")

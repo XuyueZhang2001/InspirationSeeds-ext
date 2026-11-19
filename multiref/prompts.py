@@ -7,9 +7,15 @@ Role modes (how the main image is designated):
     embed   main image marked by the learnable role embedding E_main; order unchanged
     slot    main image moved to the first position
     index   main image named by its position in the prompt ("image k"); no embedding
+    tid     main image keeps its position; its tokens get position id t = 2 instead of 1
+            (multiref.conditioning.build_reference_tokens). Uses the "embed" sentence
+            ("the marked image"), so it shares the cached text embedding "main_embed".
+            Without a main image every reference has t = 1, so no position is special.
 """
 
-ROLE_MODES = ("embed", "slot", "index")
+ROLE_MODES = ("embed", "slot", "index", "tid")
+# role modes whose main-image sentence is the "embed" one (same cached text embedding)
+MARKED_MODES = ("embed", "tid")
 MAX_REFS = 4
 
 BASE = "Combine the elements in the reference images into a single object inspired by them."
@@ -28,6 +34,8 @@ def prompt_key(main_pos, role_mode: str) -> str:
         return "base"
     if role_mode == "index":
         return f"main_index_{main_pos + 1}"
+    if role_mode in MARKED_MODES:
+        return "main_embed"
     return f"main_{role_mode}"
 
 
@@ -38,6 +46,8 @@ def render_prompt(main_pos, role_mode: str) -> str:
         return BASE
     if role_mode == "index":
         return f"{BASE} {MAIN['index'].format(k=main_pos + 1)}"
+    if role_mode in MARKED_MODES:
+        return f"{BASE} {MAIN['embed']}"
     return f"{BASE} {MAIN[role_mode]}"
 
 

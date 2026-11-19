@@ -1,16 +1,19 @@
 """
 eval_multiref.py -- designation gap and first-position bias of a train_multiref.py checkpoint.
-Last modified: 2026-11-18
+Last modified: 2026-11-19 (role mode "tid")
 
 Question answered: when the model has learned to follow a designated main image, does it follow
 the DESIGNATION, or has it learned "the first input is the main image" regardless of the prompt?
 With --role slot the main image is always moved to the first position during training, so the
-second behaviour is a real risk.
+second behaviour is a real risk. With --role tid the main image keeps its position (marked by
+t = 2) and no position is special without a designation, so the bias is expected to stay near
+the base model's value; prompt_effect is not meaningful there (order and marker both change).
 
 Metrics (designated samples; per sample with main k, target_k, the same noise and sigma for
 every condition; references shuffled once with the same seed as in training)
     designated, input j  : designated as main by the training role mode
-                           (slot: input j moved first + "first image" prompt)
+                           (slot: input j moved first + "first image" prompt;
+                            tid: input j gets t = main_t, order unchanged)
     base, input j first  : base prompt (no main image), input j moved first, no E_main
 
     gap            = mean_{j != k} L(designated j)   - L(designated k)
@@ -73,7 +76,7 @@ import torch
 from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
 from PIL import Image, ImageDraw, ImageFont
 
-from multiref.conditioning import MainRoleEmbedding, MultiRefKontextPipeline
+from multiref.conditioning import MAIN_T, MainRoleEmbedding, MultiRefKontextPipeline
 from multiref.prompts import arrange, prompt_key
 from multiref.train_data import LatentStore, load_rows, make_example, pick_overfit_rows
 from train_multiref import DEVICE, DTYPE, build_transformer, forward_loss
@@ -276,7 +279,7 @@ def rotation_images(pipe, role, by_folder, folders, store, run, args, out_dir):
             with torch.autocast("cuda", dtype=DTYPE):
                 out = pipe.generate_from_latents(
                     refs, main_pos, run.role, run.layout, role, height=size, width=size,
-                    prompt_embeds=pr["prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
+                    main_t=getattr(run, "main_t", MAIN_T), prompt_embeds=pr["prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
                     pooled_prompt_embeds=pr["pooled_prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
                     num_inference_steps=args.image_steps, guidance_scale=run.guidance_scale,
                     generator=torch.Generator(device=DEVICE).manual_seed(seed))
