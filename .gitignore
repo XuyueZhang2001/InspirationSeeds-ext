@@ -145,3 +145,7 @@ original_code/
 # Runs
 runs/
 
+# Logs
+logs/
+*.log
+*.out

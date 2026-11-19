@@ -1,6 +1,7 @@
 """
 select_targets.py -- suggest designated-subject targets for manual review (synthesize_v2_1.py outputs).
-Last modified: 2026-11-17
+Last modified: 2026-11-19 (default paths under data/: --synth-root data/synth/v2_1, --output-dir data/selection)
+               2026-11-17
 
 This script only SUGGESTS which cells to keep. The final choice is made by hand in the
 review folders; build_dataset.py reads what is left in the keep/ folders.
@@ -67,7 +68,8 @@ Other output (--output-dir)
 
 Usage
 -----
-    python select_targets.py --synth-root output/synth/v2_1_1024 --output-dir output/selection
+    python select_targets.py            # data/synth/v2_1 -> data/selection
+    python select_targets.py --synth-root data/synth/v2_1_768 --output-dir data/selection_768
 """
 
 import argparse
@@ -265,9 +267,9 @@ def write_review_folder(review_dir: Path, folder: Path, synth_dir: Path, inputs,
 # --------------------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description="Suggest designated-subject targets for manual review")
-    p.add_argument("--synth-root", type=Path, default=Path("output/synth/v2_1_1024"),
+    p.add_argument("--synth-root", type=Path, default=Path("data/synth/v2_1"),
                    help="Output root of synthesize_v2_1.py (searched recursively for synth_meta.json)")
-    p.add_argument("--output-dir", type=Path, default=Path("output/selection"))
+    p.add_argument("--output-dir", type=Path, default=Path("data/selection"))
     p.add_argument("--copy-max", type=float, default=0.80, help="Suggest dropping cells with cos_main above this")
     p.add_argument("--lift-min", type=float, default=0.0, help="Suggest dropping cells with lift below this")
     p.add_argument("--margin-min", type=float, default=-0.15, help="Suggest dropping cells with margin below this")

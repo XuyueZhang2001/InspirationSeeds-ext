@@ -5,7 +5,7 @@ from pathlib import Path
 
 from datasets import load_dataset
 
-N = 20
+N = 200
 OUT = Path("samples")
 (OUT / "sources").mkdir(parents=True, exist_ok=True)
 (OUT / "paper_inputs").mkdir(parents=True, exist_ok=True)

@@ -1,9 +1,11 @@
 """
 build_dataset.py -- training / validation manifests for multi-reference fine-tuning.
-Last modified: 2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
+Last modified: 2026-11-19 (default paths: --decomp-root data/no_main, --review-dir data/selection/review)
+               2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
 
 Two sample pools:
-    unspecified  every decomposition folder in --decomp-root (output/decompose/v72_final):
+    unspecified  every decomposition folder in --decomp-root (data/no_main, the hand-picked
+                 decompositions of all v7.2 settings; output/decompose/ keeps the raw runs):
                  inputs = input_0.jpeg, input_1.jpeg, ...; no main image;
                  target = the original source image (path from groups.json "image", or found by
                  stem in --source-dir); recon.jpeg is not used
@@ -15,7 +17,7 @@ Two sample pools:
                  dataset and must not be deleted before cache_features.py has run.
 
 The designated samples were synthesized on generate_source, a hand-picked copy of part of
-v72_final. For every review folder, the inputs are compared byte by byte with the folder of
+no_main (screen_sources.py, then manual choice). For every review folder, the inputs are compared byte by byte with the folder of
 the same name in --decomp-root: if they are identical, the --decomp-root paths are used (both
 pools then share the cached input latents); otherwise the inputs used for the synthesis are
 kept and the folder is reported, because a target must always come with the inputs it was
@@ -37,8 +39,9 @@ Output (--output-dir)
 
 Usage
 -----
-    python build_dataset.py --decomp-root output/decompose/v72_final \\
-        --review-dir output/selection/review --output-dir data/multiref
+    python build_dataset.py             # data/no_main + data/selection/review -> data/multiref
+    python build_dataset.py --decomp-root data/no_main \\
+        --review-dir data/selection/review --output-dir data/multiref_v2
 """
 
 import argparse
@@ -102,9 +105,9 @@ def stratified_split(stems_designated, stems_other, frac, rng):
 
 def main():
     p = argparse.ArgumentParser(description="Build manifests for multi-reference fine-tuning")
-    p.add_argument("--decomp-root", type=Path, default=Path("output/decompose/v72_final"),
+    p.add_argument("--decomp-root", type=Path, default=Path("data/no_main"),
                    help="Decomposition folders (searched recursively); each gives one unspecified sample")
-    p.add_argument("--review-dir", type=Path, default=Path("output/selection/review"),
+    p.add_argument("--review-dir", type=Path, default=Path("data/selection/review"),
                    help="Manual review folders from select_targets.py (designated samples)")
     p.add_argument("--source-dir", type=Path, default=Path("samples/sources"),
                    help="Fallback location of the source images (<stem>.<ext>) if groups.json has no valid path")

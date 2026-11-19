@@ -23,6 +23,7 @@ Last README update: 2026-11-17.
 | **`decompose_v7_2.py`** | **Recommended** decomposition: adaptive grouping of SAE features, coverage expansion, merging, shared-part weakening, subject kept in one input (see below) |
 | `decompose_groups.py`, `decompose_v4.py` … `decompose_v7_1.py` | Earlier versions of the adaptive decomposition, kept for comparison (history below) |
 | `decompose.py` | Earlier fixed-K baseline (k-means into K = 2, 3, 4 clusters); no longer documented |
+| **`screen_sources.py`** | Automatic first pass over `data/no_main/`: folders with at least two distinct, source-related subjects are copied to `generate_source/screening/` for the manual choice of synthesis sources (table and contact sheets in `generate_source/screening/_report/`) |
 | **`synthesize_v2_1.py`** | **Recommended** designated-subject target synthesis for `decompose_v7_2.py` outputs: closeness-dependent 2 × 2 grid of interpolation weight × img2img strength (see below) |
 | `synthesize_v2.py` | Previous version: the same synthesis with a full 3 × 3 grid for every main |
 | `synthesize_target.py` | Earlier level-based weighted target synthesis for `decompose.py` outputs |
@@ -33,7 +34,7 @@ Last README update: 2026-11-17.
 | **`generate_multi.py`** | Inference with 2–4 images and an optional main image (`--main k`), with a trained LoRA and role embedding |
 | `check_multiref.py` | Sanity checks of the multi-reference conditioning against the stock Kontext pipeline, plus baseline images of the base model |
 | `multiref/` | Shared code: prompt templates (`prompts.py`), manifest / cache helpers (`data.py`), reference encoding, position ids, role embedding and pipeline (`conditioning.py`), training data sampling (`train_data.py`) |
-| `fetch_hf_samples.py` | Downloads a random subset of the paper's training data from Hugging Face |
+| `fetch_samples.py` | Downloads a random subset of the paper's training data from Hugging Face |
 | `probe_inputs.py` | Checks whether the released model uses both inputs (swap / duplicate / blank conditions, DINOv2 and CLIP metrics) |
 | `summarize_none.py` | Prints a table of the unweighted (`none`) target measurements across folders |
 | `check_sae.py` | Small diagnostic that prints the SAE structure and decoder bias |
@@ -44,33 +45,52 @@ Last README update: 2026-11-17.
 
 ## Pipeline overview
 
-All scripts are run from the repository root. Paths below are the ones used so far.
+All scripts are run from the repository root; the defaults of every script follow this layout.
+
+```
+samples/sources/              source images (fetch_samples.py)
+output/decompose/<run>/       raw decompose_v7_2.py runs, one per setting (nothing else goes to output/)
+data/no_main/                 hand-picked decomposition folders of all runs: the unspecified pool
+generate_source/screening/    screen_sources.py candidates, waiting for the manual review
+    _report/                  screen.csv, contact sheets, summary.json
+generate_source/              reviewed synthesis sources (moved here from screening/)
+data/synth/                   synthesize_v2_1.py targets
+data/selection/review/        select_targets.py review folders (manual keep / drop): the designated pool
+data/multiref/                build_dataset.py manifests + cache_features.py cache
+runs/                         training runs
+```
 
 ```bash
 SRC=samples/sources
 
-# 1. decomposition (768 px inputs); good multi-subject folders are copied by hand to generate_source/
-python decompose_v7_2.py --image-dir $SRC --output-dir output/decompose/v72_final
+# 1. decomposition (768 px inputs), one output folder per setting; the good folders of all
+#    settings are copied by hand to data/no_main/
+python decompose_v7_2.py --image-dir $SRC --output-dir output/decompose/base_s1
+python decompose_v7_2.py --image-dir $SRC --output-dir output/decompose/c05 --clean-frac 0.5
 
-# 2. designated-subject targets (1024 px) for the hand-picked folders
-python synthesize_v2_1.py --root generate_source --output-dir output/synth/v2_1_1024 --size 1024
+# 2. synthesis sources: automatic screening of data/no_main/ -> generate_source/screening/,
+#    then move the good folders to generate_source/ by hand (delete the others)
+python screen_sources.py --dry-run          # report only, to check the thresholds
+python screen_sources.py
 
-# 3. suggestions + manual selection in output/selection/review/<folder>/main<k>/keep|drop
-python select_targets.py --synth-root output/synth/v2_1_1024 --output-dir output/selection
+# 3. designated-subject targets (1024 px) for generate_source/ (screening/ is skipped)
+python synthesize_v2_1.py                   # generate_source -> data/synth
 
-# 4. training data: manifests and cached latents / prompt embeddings
-python build_dataset.py --decomp-root output/decompose/v72_final \
-    --review-dir output/selection/review --source-dir $SRC --output-dir data/multiref
+# 4. suggestions + manual selection in data/selection/review/<folder>/main<k>/keep|drop
+python select_targets.py                    # data/synth -> data/selection
+
+# 5. training data: manifests and cached latents / prompt embeddings
+python build_dataset.py                     # data/no_main + data/selection/review -> data/multiref
 python cache_features.py --manifest-dir data/multiref --target-size 1024
 
-# 5. checks, overfitting test, training
-python check_multiref.py --folder output/decompose/v72_final/<folder>
+# 6. checks, overfitting test, training
+python check_multiref.py --folder data/no_main/<folder>
 python train_multiref.py --data-dir data/multiref --output-dir runs/overfit --overfit 8 \
     --max-steps 1500 --warmup-steps 50 --grad-accum 1 --val-every 100 --image-every 250 --save-every 500
 python train_multiref.py --data-dir data/multiref --output-dir runs/v1 --max-steps 10000
 
-# 6. inference
-python generate_multi.py --folder output/decompose/v72_final/<folder> --main 2 \
+# 7. inference
+python generate_multi.py --folder data/no_main/<folder> --main 2 \
     --lora runs/v1/checkpoint-010000/lora --role-embedding runs/v1/checkpoint-010000/role_embedding.safetensors
 ```
 
@@ -172,20 +192,20 @@ Steps 9–11 replaced two earlier ideas that did not work: weakening the subject
 
 ```bash
 # default setting (alpha_r 0.7, cleaning 0.3), no debug images
-python decompose_v7_2.py --image-dir samples/sources --output-dir output/v72
+python decompose_v7_2.py --image-dir samples/sources --output-dir output/decompose/v72
 
 # one image, with diagnostic images
-python decompose_v7_2.py --image samples/sources/<name>.jpeg --output-dir output/v72_test --debug-images
+python decompose_v7_2.py --image samples/sources/<name>.jpeg --output-dir output/decompose/v72_test --debug-images
 
 # another decoding seed (same embeddings, different renderings)
-python decompose_v7_2.py --image-dir samples/sources --output-dir output/v72_seed2 --seed 2
+python decompose_v7_2.py --image-dir samples/sources --output-dir output/decompose/v72_seed2 --seed 2
 
 # other cleaning fraction / shared-part strength
-python decompose_v7_2.py --image-dir samples/sources --output-dir output/v72_c05 --clean-frac 0.5
+python decompose_v7_2.py --image-dir samples/sources --output-dir output/decompose/v72_c05 --clean-frac 0.5
 
 # force the subject noun for some images
 echo '{"14": "kite", "phone_01": "smartphone"}' > subjects.json
-python decompose_v7_2.py --image-dir samples/sources --output-dir output/v72 --subject-map subjects.json
+python decompose_v7_2.py --image-dir samples/sources --output-dir output/decompose/v72 --subject-map subjects.json
 ```
 
 Existing output folders are skipped unless `--overwrite` is given, so use a new `--output-dir` for every setting. The first time a noun is used, its subspace costs 2 × 40 × `--prior-samples` prior runs (batched); afterwards it is read from `text_cache/`.
@@ -208,7 +228,7 @@ The decompositions are used to build fine-tuning data, so every source folder is
 
 ```bash
 SRC=samples/sources          # source folder
-OUT=output/v72               # one subfolder per run
+OUT=output/decompose          # one subfolder per run
 
 python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/base_s1 --seed 1
 python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/base_s2 --seed 2
@@ -221,7 +241,7 @@ python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/obj03   --alpha-obj 
 python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/n2      --n-max 2
 ```
 
-Resulting layout: `output/v72/<run>/<stem>_topk64_s{seed}_c{c}_a{a}_obj{obj}/` (e.g. `output/v72/c05/14_topk64_s1_c0.5_a0.7_obj0.5/`) with `input_*.jpeg`, `overview.jpeg`, `embeds.pt`, `groups.json`, plus `output/v72/<run>/summary.json`. For one source image there are therefore up to 9 candidate input sets; comparing the `overview.jpeg` of the same `<stem>` across runs is the quickest visual check.
+Resulting layout: `output/decompose/<run>/<stem>_topk64_s{seed}_c{c}_a{a}_obj{obj}/` (e.g. `output/decompose/c05/14_topk64_s1_c0.5_a0.7_obj0.5/`) with `input_*.jpeg`, `overview.jpeg`, `embeds.pt`, `groups.json`, plus `output/decompose/<run>/summary.json`. For one source image there are therefore up to 9 candidate input sets; comparing the `overview.jpeg` of the same `<stem>` across runs is the quickest visual check. The good folders of all runs are copied (flat, the folder names differ between settings) to `data/no_main/`, the unspecified pool of `build_dataset.py`; several settings of one source may be kept. The `restore` and `n2` runs have the same folder names as `base_s1`, so only one of these three versions of a source can be kept in `data/no_main/`.
 
 Notes:
 - The subject subspaces are cached in `text_cache/` and shared by all runs (the prior settings are the same), so only the first run pays for them.
@@ -251,7 +271,7 @@ Defaults are the values in the code (updated 2026-11-14: `--clean-frac 0.3`, `--
 | Argument | Default | Description |
 |---|---|---|
 | `--image` / `--image-dir` | (one required) | One image, or a folder (`.jpg .jpeg .png .webp .bmp`) |
-| `--output-dir` | `groups_out` | Output root; one subfolder per image |
+| `--output-dir` | `output/decompose/v72` | Output root; one subfolder per image |
 | `--overwrite` | off | Recompute folders that already contain `groups.json` |
 | `--debug-images` | off | Also decode diagnostic images (see *Output*); several extra decodes per image |
 
@@ -406,7 +426,7 @@ In this analysis the closeness was approximated from `synthesize_v2.py` outputs;
 
 ```bash
 # default: class-dependent 2 x 2 grid for every input of every folder, 1024 px targets
-python synthesize_v2_1.py --root generate_source --output-dir output/synth/v2_1_1024
+python synthesize_v2_1.py --root generate_source --output-dir data/synth
 
 # try the first 3 folders only
 python synthesize_v2_1.py --limit 3
@@ -430,7 +450,8 @@ Folders that already contain `synth_meta.json` are skipped unless `--overwrite` 
 | Argument | Default | Description |
 |---|---|---|
 | `--root` | `generate_source` | Directory with decomposition folders (searched recursively for `embeds.pt` + `input_0.jpeg`), or one such folder |
-| `--output-dir` | `output/synth/v2_1` | Output root; the folder structure under `--root` is kept |
+| `--exclude` | `screening` | Comma-separated directory names under `--root` that are skipped (the unreviewed `screen_sources.py` candidates) |
+| `--output-dir` | `data/synth` | Output root; the folder structure under `--root` is kept |
 | `--close-threshold` | 0.6 | An input is close if $\cos(f(\text{input}), f(\text{recon})) \ge$ this value; 0 = every input close, > 1 = every input far |
 | `--close-t` | `0,0.3` | Interpolation weights $t$ for close mains |
 | `--close-s` | `0.7,0.9` | img2img strengths for close mains |
@@ -502,7 +523,7 @@ where the mean runs over the cells of main $j$ that pass the first three checks 
 ### Review folders
 
 ```
-output/selection/
+data/selection/
     review/<folder>/
         _overview.jpeg          everything needed to decide, in one image
         _inputs.jpeg            all inputs, labelled input_0, input_1, ...
@@ -537,13 +558,13 @@ What to look for: the main input dominates (shape or pose kept, category may cha
 ### Usage and parameters
 
 ```bash
-python select_targets.py --synth-root output/synth/v2_1_1024 --output-dir output/selection
+python select_targets.py --synth-root data/synth --output-dir data/selection
 ```
 
 | Argument | Default | Description |
 |---|---|---|
-| `--synth-root` | `output/synth/v2_1_1024` | Output root of `synthesize_v2_1.py` (searched for `synth_meta.json`) |
-| `--output-dir` | `output/selection` | Review folders, `suggestions.csv`, `summary.json` |
+| `--synth-root` | `data/synth` | Output root of `synthesize_v2_1.py` (searched for `synth_meta.json`) |
+| `--output-dir` | `data/selection` | Review folders, `suggestions.csv`, `summary.json` |
 | `--copy-max`, `--lift-min`, `--margin-min`, `--distinct-min` | 0.80, 0.0, −0.15, 0.03 | Thresholds of the suggestions |
 | `--overview-tile` | 288 | Image size in `_overview.jpeg` |
 | `--overwrite` | off | Rebuild every review folder from the suggestions (discards manual changes and deletions) |
@@ -556,10 +577,10 @@ python select_targets.py --synth-root output/synth/v2_1_1024 --output-dir output
 
 | Pool | Inputs | Main | Target | Source |
 |---|---|---|---|---|
-| unspecified | `input_*.jpeg` of a decomposition folder | none | the original source image (path from `groups.json` → `image`, else `<stem>.*` in `--source-dir`) | every folder of `--decomp-root` (`output/decompose/v72_final`), one sample each; `recon.jpeg` is not used |
+| unspecified | `input_*.jpeg` of a decomposition folder | none | the original source image (path from `groups.json` → `image`, else `<stem>.*` in `--source-dir`) | every folder of `--decomp-root` (`data/no_main`), one sample each; `recon.jpeg` is not used |
 | designated | the same inputs | input $k$ | the files in `review/<folder>/main<k>/keep/`, one picked at random per draw | the review folders of `select_targets.py` |
 
-- **Input consistency.** The designated targets were synthesized on `generate_source/`, a hand-picked copy of part of `v72_final`. For every review folder the inputs are compared byte by byte with the folder of the same name in `--decomp-root`; if identical, the `v72_final` paths are used (both pools share the cached latents), otherwise the inputs of the synthesis are kept and the folder is reported, because a target must come with the inputs it was synthesized from.
+- **Input consistency.** The designated targets were synthesized on `generate_source/`, a hand-picked copy of part of `data/no_main` (`screen_sources.py` + manual review). For every review folder the inputs are compared byte by byte with the folder of the same name in `--decomp-root`; if identical, the `data/no_main` paths are used (both pools share the cached latents), otherwise the inputs of the synthesis are kept and the folder is reported, because a target must come with the inputs it was synthesized from.
 - **Split by source image**, stratified: `--val-frac` (10 %) of the sources that have designated samples and 10 % of the others go to validation, so validation contains both pools.
 - **No ratio in the manifests.** The share of the two pools is decided during training by the pool schedule (see below); the manifests only record the pool of every sample, and the input order is shuffled at training time.
 
@@ -574,15 +595,15 @@ Output (`--output-dir`, default `data/multiref`): `train.jsonl`, `val.jsonl` (on
 ### Usage and parameters
 
 ```bash
-python build_dataset.py --decomp-root output/decompose/v72_final \
-    --review-dir output/selection/review --source-dir samples/sources --output-dir data/multiref
+python build_dataset.py --decomp-root data/no_main \
+    --review-dir data/selection/review --source-dir samples/sources --output-dir data/multiref
 python cache_features.py --manifest-dir data/multiref --target-size 1024
 ```
 
 | Script | Argument | Default | Description |
 |---|---|---|---|
-| `build_dataset.py` | `--decomp-root` | `output/decompose/v72_final` | Decomposition folders (unspecified pool) |
-| | `--review-dir` | `output/selection/review` | Review folders (designated pool) |
+| `build_dataset.py` | `--decomp-root` | `data/no_main` | Decomposition folders (unspecified pool) |
+| | `--review-dir` | `data/selection/review` | Review folders (designated pool) |
 | | `--source-dir` | `samples/sources` | Fallback location of the source images |
 | | `--val-frac`, `--seed` | 0.1, 0 | Validation fraction of the source images, split seed |
 | | `--min-inputs`, `--max-inputs` | 2, 4 | Allowed number of inputs |
@@ -681,7 +702,7 @@ What to check: the sample images approach the targets; for a designated folder t
 
 ```bash
 # base model (baseline)
-python generate_multi.py --folder output/decompose/v72_final/<folder> --main 2
+python generate_multi.py --folder data/no_main/<folder> --main 2
 
 # fine-tuned LoRA + role embedding (the same --role / --layout as in training)
 python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 \
@@ -693,7 +714,7 @@ python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 \
 ## Sanity checks (`check_multiref.py`)
 
 ```bash
-python check_multiref.py --folder output/decompose/v72_final/<folder>   # all checks
+python check_multiref.py --folder data/no_main/<folder>   # all checks
 python check_multiref.py --skip-model                                      # check 0 only
 ```
 
@@ -717,7 +738,7 @@ Dataset: [`kfirgold99/Inspiration-Seeds-Training`](https://huggingface.co/datase
 - `sample_id`: e.g. `006536c4-…__topk_32__frac_0.7`. Some rows use numeric ids instead of UUIDs.
 
 ```bash
-python fetch_hf_samples.py
+python fetch_samples.py
 ```
 
 This streams the dataset, shuffles with a fixed seed, keeps 20 distinct sources, and writes:

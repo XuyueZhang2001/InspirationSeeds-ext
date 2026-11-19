@@ -1,7 +1,8 @@
 """
 decompose_v7_2.py (v7.2) -- adaptive SAE feature grouping with coverage expansion,
 input-based merging and an image-space subject kept in exactly one input.
-Last modified: 2026-11-18 (usage example: hf_samples/sources -> samples/sources, hf_v72 -> v72)
+Last modified: 2026-11-19 (default --output-dir groups_out -> output/decompose/v72)
+               2026-11-18 (usage example: hf_samples/sources -> samples/sources, hf_v72 -> v72)
                2026-11-17 (output folder name <stem>_topk<K>_s<seed>_c<clean-frac>_a<alpha-r>_obj<alpha-obj>,
                was <stem>_topk<K>_nmax<n-max>; help text of --size, default stays 768)
 
@@ -135,8 +136,10 @@ Method (per source image)
  11. Decode every input with Kandinsky 2.2, same seed for every input.
 
 Usage:
-  python decompose_v7_2.py --image path/to/img.jpeg --output-dir v72_out
-  python decompose_v7_2.py --image-dir samples/sources --output-dir v72
+  python decompose_v7_2.py --image path/to/img.jpeg --output-dir output/decompose/test
+  python decompose_v7_2.py --image-dir samples/sources --output-dir output/decompose/base_s1
+  (output/decompose/ keeps the raw runs only; the folders used for training are copied by hand
+   to data/no_main/)
 """
 
 import argparse
@@ -993,7 +996,7 @@ def main():
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--image", help="One source image")
     src.add_argument("--image-dir", help="Folder of source images")
-    p.add_argument("--output-dir", default="groups_out")
+    p.add_argument("--output-dir", default="output/decompose/v72")
     p.add_argument("--top-k", type=int, default=64, help="Number of top-activated SAE features (K)")
     p.add_argument("--n-max", type=int, default=4, help="Maximum number of main groups")
     p.add_argument("--min-salience", type=float, default=0.1,
