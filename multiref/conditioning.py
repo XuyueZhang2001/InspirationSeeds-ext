@@ -33,6 +33,15 @@ Pipeline
     references are injected, it returns them as the image tokens instead of encoding the
     `image` argument. Everything else (scheduler, denoising loop, LoRA loading) is the
     stock pipeline.
+
+Main guidance (inference only, role modes "tid" and "embed"; added 2026-11-20)
+    Classifier-free-guidance-like amplification of the designation. At every denoising step
+    with sigma >= main_guidance_min_sigma the transformer is run twice:
+        v_main  designated input (t marker / E_main on, marked prompt)
+        v_none  no main image (every reference at t = 1, E_main off, base prompt)
+    and the prediction is v = v_none + w * (v_main - v_none), w = main_guidance (1 = off).
+    The transformer's forward is wrapped for the duration of one pipeline call, so the
+    stock denoising loop is unchanged. Guided steps cost two forward passes.
 """
 
 from __future__ import annotations
@@ -43,7 +52,7 @@ from diffusers import FluxKontextPipeline
 from PIL import Image
 from safetensors.torch import load_file, save_file
 
-from .prompts import ROLE_MODES, arrange
+from .prompts import BASE, ROLE_MODES, arrange
 
 LAYOUTS = ("canvas", "per_t")
 MAIN_T = 2.0  # t id of the main reference in role mode "tid" (the other references have t = 1)
@@ -256,7 +265,8 @@ class MultiRefKontextPipeline(FluxKontextPipeline):
     def generate_multi(self, references, main=None, role_mode: str = "embed", layout: str = "canvas",
                        role_embedding: MainRoleEmbedding | None = None, ref_size: int = 512,
                        height: int = 1024, width: int = 1024, prompt: str | None = None,
-                       main_t: float = MAIN_T, **kwargs):
+                       main_t: float = MAIN_T, main_guidance: float = 1.0, main_guidance_min_sigma: float = 0.0,
+                       **kwargs):
         """Generate from 2-4 reference images.
 
         references:     list of PIL images, in the user's order
@@ -265,6 +275,8 @@ class MultiRefKontextPipeline(FluxKontextPipeline):
                         "tid" (main image gets position id t = main_t)
         role_embedding: MainRoleEmbedding attached to self.transformer (used with role_mode "embed")
         main_t:         t id of the main image with role_mode "tid"
+        main_guidance:  weight w of the main guidance (1 = off; see the module docstring)
+        main_guidance_min_sigma: main guidance only at steps with sigma >= this value
         prompt:         override the template prompt (normally left None)
         kwargs:         passed to the pipeline (num_inference_steps, guidance_scale, generator, ...)
 
@@ -276,18 +288,22 @@ class MultiRefKontextPipeline(FluxKontextPipeline):
         latents = self.encode_references([references[i] for i in order], ref_size)
         prompt = prompt or template
         out = self.generate_from_latents(latents, main_pos, role_mode, layout, role_embedding,
-                                         height=height, width=width, prompt=prompt, main_t=main_t, **kwargs)
+                                         height=height, width=width, prompt=prompt, main_t=main_t,
+                                         main_guidance=main_guidance,
+                                         main_guidance_min_sigma=main_guidance_min_sigma, **kwargs)
         return out, {"order": order, "main_pos": main_pos, "prompt": prompt}
 
     @torch.no_grad()
     def generate_from_latents(self, ref_latents, main_pos=None, role_mode: str = "embed", layout: str = "canvas",
                               role_embedding: MainRoleEmbedding | None = None, height: int = 1024, width: int = 1024,
-                              main_t: float = MAIN_T, **kwargs):
+                              main_t: float = MAIN_T, main_guidance: float = 1.0,
+                              main_guidance_min_sigma: float = 0.0, **kwargs):
         """Generate from reference latents that are already in model order (e.g. cached latents).
 
         ref_latents: list of [1, 16, h, w] normalized VAE latents, in model order
         main_pos:    position of the main reference in that order, or None
         main_t:      t id of the main reference with role_mode "tid"
+        main_guidance, main_guidance_min_sigma: see generate_multi (needs main_pos and role_mode tid / embed)
         kwargs:      passed to the pipeline: prompt or prompt_embeds + pooled_prompt_embeds, steps, guidance, ...
                      (the prompt must match role_mode and main_pos, see multiref.prompts)
         """
@@ -297,11 +313,74 @@ class MultiRefKontextPipeline(FluxKontextPipeline):
                                                     main_pos=marker_pos(role_mode, main_pos), main_t=main_t)
         if role_embedding is not None:
             role_embedding.set_main(spans, main_pos if role_mode == "embed" else None)
+        restore = None
+        if main_guidance != 1.0 and main_pos is not None:
+            if role_mode not in ("tid", "embed"):
+                raise ValueError("main guidance needs role mode 'tid' or 'embed'")
+            restore = self._wrap_main_guidance(role_mode, spans, main_pos, role_embedding, main_guidance,
+                                               main_guidance_min_sigma,
+                                               kwargs.get("max_sequence_length", 512))
         self._multiref = (tokens, ids)
         try:
             # max_area must match height * width: the pipeline rescales the output to max_area
             return self(height=height, width=width, max_area=height * width, **kwargs)
         finally:
             self._multiref = None
+            if restore is not None:
+                restore()
             if role_embedding is not None:
                 role_embedding.clear()
+
+    def _wrap_main_guidance(self, role_mode, spans, main_pos, role_embedding, weight, min_sigma,
+                            max_sequence_length):
+        """Wrap transformer.forward with the main guidance; returns a function that undoes it.
+
+        The stock loop calls the transformer with keyword arguments only (hidden_states, timestep =
+        sigma, guidance, pooled_projections, encoder_hidden_states, txt_ids, img_ids, ...). The
+        "no main" pass replaces the prompt by the base prompt, sets the t id of every reference
+        token to 1 (img_ids: t = 0 for the generated image, 1 or main_t for the references) and
+        switches E_main off.
+        """
+        device = self._execution_device
+        none_embeds, none_pooled, none_txt_ids = self.encode_prompt(
+            prompt=BASE, prompt_2=None, device=device, num_images_per_prompt=1,
+            max_sequence_length=max_sequence_length)
+        transformer = self.transformer
+        had_instance_forward = "forward" in transformer.__dict__
+        orig_forward = transformer.forward
+
+        def guided_forward(*args, **kw):
+            out_main = orig_forward(*args, **kw)
+            sigma = float(kw["timestep"].flatten()[0])
+            if sigma < min_sigma:
+                return out_main
+            batch = kw["hidden_states"].shape[0]
+            dtype = kw["encoder_hidden_states"].dtype
+            img_ids = kw["img_ids"].clone()
+            img_ids[..., 0] = (img_ids[..., 0] > 0).to(img_ids.dtype)  # references: t = 1
+            kw_none = dict(kw, img_ids=img_ids,
+                           encoder_hidden_states=none_embeds.to(dtype).repeat(batch, 1, 1),
+                           pooled_projections=none_pooled.to(dtype).repeat(batch, 1),
+                           txt_ids=none_txt_ids)
+            if role_embedding is not None and role_mode == "embed":
+                role_embedding.set_main(spans, None)
+            try:
+                out_none = orig_forward(*args, **kw_none)
+            finally:
+                if role_embedding is not None and role_mode == "embed":
+                    role_embedding.set_main(spans, main_pos)
+            if isinstance(out_main, tuple):
+                v_main, v_none = out_main[0], out_none[0]
+                return (v_none + weight * (v_main - v_none),) + tuple(out_main[1:])
+            out_main.sample = out_none.sample + weight * (out_main.sample - out_none.sample)
+            return out_main
+
+        transformer.forward = guided_forward
+
+        def restore():
+            if had_instance_forward:
+                transformer.forward = orig_forward
+            else:
+                del transformer.forward
+
+        return restore

@@ -8,9 +8,9 @@ The long-term goal of this fork is to support **N input images with an optional 
 2. synthesizing **designated-subject target images** (1024 px): **`synthesize_v2_1.py`**: for every input designated as the main subject, a target pulled toward that input, so that the same input set gives different targets for different designations;
 3. selecting the targets by hand, with automatic suggestions: **`select_targets.py`**;
 4. building the training data: **`build_dataset.py`** and **`cache_features.py`**;
-5. fine-tuning FLUX.1 Kontext dev (new LoRA + a main-image role embedding) on 2–4 reference images with an optional main image: **`train_multiref.py`**; inference with **`generate_multi.py`**.
+5. fine-tuning FLUX.1 Kontext dev (new LoRA; the main image is marked by its position id) on 2–4 reference images with an optional main image: **`train_multiref.py`**; evaluation with **`eval_multiref.py`**, inference with **`generate_multi.py`**.
 
-Last README update: 2026-11-17.
+Last README update: 2026-11-20.
 
 ---
 
@@ -30,8 +30,9 @@ Last README update: 2026-11-17.
 | **`select_targets.py`** | Suggests which synthesized targets to keep and writes review folders (`keep/`, `drop/`, `_overview.jpeg`) for the manual selection (see below) |
 | **`build_dataset.py`** | Training / validation manifests: unspecified samples (decomposition + source image) and designated samples (decomposition + kept targets) |
 | **`cache_features.py`** | Caches VAE latents (references 512 px, targets 1024 px) and the prompt embeddings, so training only needs the transformer |
-| **`train_multiref.py`** | LoRA + main-image role embedding fine-tuning of FLUX.1 Kontext dev with 2–4 references; pool schedule, validation images, checkpoints, overfitting test |
-| **`generate_multi.py`** | Inference with 2–4 images and an optional main image (`--main k`), with a trained LoRA and role embedding |
+| **`train_multiref.py`** | LoRA fine-tuning of FLUX.1 Kontext dev with 2–4 references and an optional main image (default: marked by position id $t = 2$); pool schedule, designation gap, validation images, checkpoints, overfitting test |
+| **`eval_multiref.py`** | Designation gap and first-position bias of a checkpoint, with rotation images |
+| **`generate_multi.py`** | Inference with 2–4 images and an optional main image (`--main k`), with a trained LoRA (and role embedding for `--role embed`) |
 | `check_multiref.py` | Sanity checks of the multi-reference conditioning against the stock Kontext pipeline, plus baseline images of the base model |
 | `multiref/` | Shared code: prompt templates (`prompts.py`), manifest / cache helpers (`data.py`), reference encoding, position ids, role embedding and pipeline (`conditioning.py`), training data sampling (`train_data.py`) |
 | `fetch_samples.py` | Downloads a random subset of the paper's training data from Hugging Face |
@@ -87,11 +88,11 @@ python cache_features.py --manifest-dir data/multiref --target-size 1024
 python check_multiref.py --folder data/no_main/<folder>
 python train_multiref.py --data-dir data/multiref --output-dir runs/overfit --overfit 8 \
     --max-steps 1500 --warmup-steps 50 --grad-accum 1 --val-every 100 --image-every 250 --save-every 500
+python eval_multiref.py --checkpoint runs/overfit/checkpoint-001500
 python train_multiref.py --data-dir data/multiref --output-dir runs/v1 --max-steps 10000
 
-# 7. inference
-python generate_multi.py --folder data/no_main/<folder> --main 2 \
-    --lora runs/v1/checkpoint-010000/lora --role-embedding runs/v1/checkpoint-010000/role_embedding.safetensors
+# 7. inference (default role tid, as in training)
+python generate_multi.py --folder data/no_main/<folder> --main 2 --lora runs/v1/checkpoint-010000/lora
 ```
 
 | Step | Resolution |
@@ -623,16 +624,18 @@ A new LoRA is trained on FLUX.1 Kontext dev (the paper's released LoRA is not us
 - **References.** Each reference is encoded separately (512 px → 32 × 32 = 1024 tokens). The groups are concatenated, contiguous and in model order, after the 4096 tokens of the image being generated. With 4 references the image sequence has 8192 tokens (the same number of reference tokens as the paper's 1024 px grid, without white padding).
 - **Position ids** $(t, h, w)$; the generated image has $t = 0$:
   - `canvas` (default): $t = 1$ for every reference, groups side by side along $w$ (a "virtual canvas"); the same ids as concatenating the latents along the width for the stock pipeline, only in contiguous per-reference order;
-  - `per_t` (ablation): reference $k$ gets $t = k + 1$, with $h, w$ scaled so that every reference spans the whole grid of the generated image.
+  - `per_t` (ablation): reference $k$ gets $t = k + 1$, with $h, w$ scaled so that every reference spans the whole grid of the generated image. The base model gave unstable results with it (`check_multiref.py`, check 5).
 - **Main image** (`--role`):
 
   | Role mode | Order of the references | How the main image is marked | Prompt |
   |---|---|---|---|
-  | `embed` (default) | shuffled | learnable vector $E_{main}$ (3072-d, zero-initialized) added to every token of the main reference after `transformer.x_embedder` (forward hook) | "… Use the marked image as the main object …" |
+  | **`tid` (default)** | shuffled | position id $t$ = `--main-t` (2) instead of 1 for every token of the main reference; $h, w$ and the order unchanged (`canvas` only) | "… Use the marked image as the main object …" |
+  | `embed` | shuffled | learnable vector $E_{main}$ (3072-d, zero-initialized) added to every token of the main reference after `transformer.x_embedder` (forward hook) | "… Use the marked image as the main object …" |
   | `slot` | main first, others shuffled | position only | "… Use the first image as the main object …" |
   | `index` | shuffled | named in the prompt | "… Use image k as the main object …" |
 
-  Without a main image, every mode uses the base prompt "Combine the elements in the reference images into a single object inspired by them." The generator only ever sees these fixed templates (`multiref/prompts.py`); free-form user text would be mapped to "main image k" or "none" beforehand.
+  Without a main image, every mode uses the base prompt "Combine the elements in the reference images into a single object inspired by them." The generator only ever sees these fixed templates (`multiref/prompts.py`); free-form user text would be mapped to "main image k" or "none" beforehand. `tid` and `embed` share the same cached prompt.
+- **Why `tid` is the default.** Kontext already uses the $t$ axis of its 3-axis RoPE to tell the generated image ($t = 0$) from the context ($t = 1$). Moving the main reference to $t = 2$ rotates its queries and keys in the $t$ frequency band, so it changes the attention between the generated image and the main reference in every layer, without extra parameters (unlike `embed`, whose $E_{main}$ stayed too small to be used). The order of the references and their $(h, w)$ ids do not change, so, unlike `slot`, no position becomes "the main position", and a sample without a main image gives exactly the same input as before. The base model does not react to $t = 2$ (designation gap ≈ 0 at step 0, baseline images of `check_multiref.py`), so the LoRA has to learn the meaning of the marker. `tid` needs the `canvas` layout (`per_t` already uses $t$ for every reference). See *Current findings* for the overfitting tests of the four modes.
 - **Pipeline.** `MultiRefKontextPipeline` overrides only `prepare_latents`, so that the injected reference tokens and ids are used instead of one encoded `image`. The output size must be passed together with `max_area = height × width` (the pipeline rescales the output to `max_area` otherwise); `generate_multi` does this.
 
 ### Training step
@@ -641,58 +644,129 @@ Batch 1, `--grad-accum` samples per optimizer step; as in the diffusers example 
 
 1. **Pool**: unspecified with probability `--unspec-schedule(progress)`, else designated.
 2. **Sample**: unspecified → uniform over folders; designated → uniform over folders, then mains, then kept targets (every source counts the same, however many mains and targets it has).
-3. **Order** of the references shuffled; prompt template of the main position; cached latents and prompt embeddings.
-4. **Noise**: $\sigma$ from the scheduler's training table (`--weighting-scheme none` = uniform, or `logit_normal`), $x_\sigma = (1-\sigma)\,x_0 + \sigma\,\varepsilon$, packed target tokens.
-5. **References** appended after the target tokens; $E_{main}$ set on the main reference (`embed`).
+3. **Order** of the references shuffled (`slot`: main moved first); prompt template of the main position; cached latents and prompt embeddings.
+4. **Noise**: $\sigma$ from the scheduler's training table (`--weighting-scheme none` = uniform, or `logit_normal`), or for designated samples from `--designated-sigma` (below); $x_\sigma = (1-\sigma)\,x_0 + \sigma\,\varepsilon$, packed target tokens.
+5. **References** appended after the target tokens; the main reference gets $t$ = `--main-t` (`tid`) or $E_{main}$ (`embed`).
 6. **Loss**: MSE between the transformer output of the target tokens and $\varepsilon - x_0$ (timestep $\sigma$, guidance embedding `--guidance-scale` 3.5).
 
-Pool schedule (default `0:1.0,0.3:1.0,0.4:0.65`): unspecified samples only for the first 30 % of the steps (learn to combine the references), linear transition until 40 %, then 65 % unspecified / 35 % designated. A single value (`0.5`) is a constant probability.
+**Pool schedule** (default `0:1.0,0.3:1.0,0.4:0.65`): unspecified samples only for the first 30 % of the steps (learn to combine the references), linear transition until 40 %, then 65 % unspecified / 35 % designated. A single value (`0.3`) is a constant probability.
+
+**Noise level of designated samples.** Which input is the main image decides the composition, and the composition is decided at high noise; at low $\sigma$ the target is mostly visible in $x_\sigma$ and the main image hardly matters. `--designated-sigma logit_normal` therefore draws the $\sigma$ of designated samples directly as $\sigma = \mathrm{sigmoid}(\mathcal N(\mu, s))$ with `--designated-sigma-mean` $\mu$ = 1 and `--designated-sigma-std` $s$ = 1 (median $\sigma \approx 0.73$; $\mu > 0$ = more high-noise samples), clamped to the range of the sigma table. Unspecified samples keep `--weighting-scheme`; the loss weighting is unchanged. In the overfitting tests this learned the designation about twice as fast as the uniform density. Note that `--weighting-scheme logit_normal` indexes the *descending* sigma table, so there a positive `--logit-mean` favours **low** $\sigma$ (as in the diffusers example).
 
 ### Defaults
 
 | Item | Default |
 |---|---|
 | Base model | `black-forest-labs/FLUX.1-Kontext-dev` transformer, bf16, gradient checkpointing |
+| Main image | `--role tid`, `--main-t 2`, `--layout canvas` |
 | LoRA | rank 32, alpha 32, on the Linear layers **inside** the transformer blocks: image and text attention, both feed-forwards of the double blocks, `proj_mlp` / `proj_out` of the single blocks (the final output projection, also named `proj_out`, is excluded); weights in fp32, forward in bf16 autocast |
-| $E_{main}$ | zero init, own parameter group |
+| $E_{main}$ | only with `--role embed`: zero init, own parameter group |
 | Optimizer | AdamW; LoRA lr 1e-4 (weight decay 1e-4), $E_{main}$ lr 1e-3 (no weight decay); 500 warmup steps, then constant; gradient clipping 1.0 |
+| Noise | uniform $\sigma$ for both pools (`--weighting-scheme none`, `--designated-sigma same`) |
 | Steps | `--max-steps` 10000 optimizer steps, `--grad-accum` 4 |
 
 ### Validation, checkpoints, logs
 
-- **Validation loss** every `--val-every` steps on a fixed set of validation samples (fixed order, target, noise, $\sigma \in \{0.25, 0.5, 0.75\}$), reported per pool. Flow-matching losses decrease slowly even when samples are memorized: compare steps and pools, not absolute values.
+- **Validation loss** every `--val-every` steps on a fixed set of validation samples (fixed order, target, noise, $\sigma \in \{0.25, 0.5, 0.75\}$), reported per pool (`val_loss_unspecified`, `val_loss_designated`). Flow-matching losses decrease slowly even when samples are memorized: compare steps and pools, not absolute values.
+- **Designation gap** every `--gap-every` steps (default = `--val-every`) and at step 0, on at most `--gap-samples` fixed designated validation samples (whole folders with the most mains first). For a sample with main $k$ and its target, with the same noise and target for every condition and for every $\sigma$ in `--gap-sigmas` (0.9, 0.75, 0.5, 0.25):
+
+  | Logged value | Definition | Meaning |
+  |---|---|---|
+  | `gap` | $\overline{L(\text{main} = j)}_{j \ne k} - L(\text{main} = k)$ | > 0: the model uses the designation |
+  | `gap_acc` | share of samples with $L(\text{main} = k) < \min_{j \ne k} L(\text{main} = j)$ | chance level: 1 / number of inputs |
+  | `gap_none` | $L(\text{no main}) - L(\text{main} = k)$ | > 0: the designated target is predicted better with the designation than without |
+
+  Each value is logged overall and per $\sigma$ (`gap_s0.9`, `gap_acc_s0.9`, …). A wrong main $j$ is designated in the same way as the right one ($t$ = `--main-t` on input $j$ for `tid`). **Look at the high-$\sigma$ values first**: they show whether the designation changes the composition; a gap only at low $\sigma$ means that the marker is used to recall details of memorized targets. At step 0 the gap should be ≈ 0 (exactly 0 for `embed`), which checks the metric itself.
 - **Sample images** every `--image-every` steps and at step 0 (`runs/<run>/samples/step_XXXXXX.jpeg`): a few validation folders, preferably with ≥ 2 designated mains; per folder the inputs, the generated images (no main, then each main) and the targets. Only the VAE is loaded in addition (prompts come from the cache).
-- **Checkpoints** every `--save-every` steps: `checkpoint-XXXXXX/lora/` (diffusers LoRA format), `role_embedding.safetensors`, `train_state.pt` (resume with `--resume`).
-- **Log** `log.jsonl` (optionally TensorBoard): loss per pool, gradient norm, pool probability, learning rate, `e_main_norm`, time per step.
+- **Checkpoints** every `--save-every` steps: `checkpoint-XXXXXX/lora/` (diffusers LoRA format), `role_embedding.safetensors` (only with `--role embed`), `train_state.pt` (resume with `--resume`). `args.json` in the run folder records all settings (read by `eval_multiref.py`).
+- **Log** `log.jsonl` (optionally TensorBoard): loss per pool, gradient norm, pool probability `p_unspec`, share of designated samples, mean $\sigma$ per pool (`sigma_designated`, `sigma_unspecified`), learning rate, time per step, the validation losses and the gap values; with `--role embed` also `e_main_norm`, `ref_token_norm` and `e_main_ratio`. Training-loss lines are dominated by the random $\sigma$ and pool of each sample; trends show in the validation loss and the gap.
 
 ### Overfitting test
 
-`--overfit N` trains on about N fixed training samples (whole designated folders with all their mains, i.e. counterfactual pairs, plus unspecified samples), one target per main, uses the same samples for validation and draws the pools 50 : 50.
+`--overfit N` trains on about N fixed training samples: whole designated folders with all their mains (counterfactual pairs) up to about N / 2 samples, one target per main, filled up with unspecified samples (first those of the same folders). The same samples are used for validation and the gap, and the pools are drawn 50 : 50 unless `--unspec-schedule` is given.
 
 ```bash
+# quick test (default role tid)
 python train_multiref.py --data-dir data/multiref --output-dir runs/overfit \
     --overfit 8 --max-steps 1500 --warmup-steps 50 --grad-accum 1 \
     --val-every 100 --image-every 250 --save-every 500
+
+# setting of the reference runs in *Current findings* (overfit_tid_hs_long, overfit_slot_hs_long)
+python train_multiref.py --data-dir data/multiref --output-dir runs/overfit_tid_hs_long \
+    --overfit 8 --max-steps 5000 --warmup-steps 50 --grad-accum 1 --lr 3e-4 \
+    --unspec-schedule 0.3 --designated-sigma logit_normal \
+    --val-every 250 --image-every 500 --save-every 1000
 ```
 
-What to check: the sample images approach the targets; for a designated folder the images of the different mains differ and follow their own targets; `val_loss_designated` approaches `val_loss_unspecified` (the gap is the ambiguity of an input set with several targets); `e_main_norm` grows steadily. With a checkpoint, `generate_multi.py` with and without `--role-embedding` should give different results for the same main, and reordering the inputs (same main) should not change the result much.
+What to check:
+- `gap_acc` rises from chance (1 / number of inputs) to 1 and `gap` becomes clearly positive, **also at $\sigma$ = 0.9**; with the second command and `tid` this happened at about step 1500.
+- In the sample images of the designated folder, the images of the different mains differ and follow their own targets; "no main" follows the unspecified target; no main is a plain copy of its input.
+- `val_loss_designated` and `val_loss_unspecified` decrease (the designated loss can end lower, since the overfitting subset has one target per main).
+- Then run `eval_multiref.py` on the last checkpoint (below).
 
-### Parameters
+The overfitting test only shows that the marker *can* carry the designation; it says nothing about generalization (validation = training samples).
+
+### Evaluation (`eval_multiref.py`)
+
+Measures, for a checkpoint, whether the model follows the **designation** or a position: a model trained with `slot` can learn "the first input is the main image" even without a designated main.
+
+```bash
+# checkpoint (overfitting run: the overfit subset; normal run: the validation split)
+python eval_multiref.py --checkpoint runs/<run>/checkpoint-005000
+
+# base model with the run's settings, for comparison
+python eval_multiref.py --checkpoint runs/<run>/checkpoint-005000 --base-only \
+    --output-dir runs/<run>/eval_base
+
+# more validation samples of a normal run
+python eval_multiref.py --checkpoint runs/<run>/checkpoint-010000 --split val --max-samples 16
+```
+
+The settings (role, layout, `--main-t`, LoRA, data, overfit subset, seed) are read from `runs/<run>/args.json`. For each designated sample (main $k$, same noise and $\sigma$ for every condition):
+
+| Metric | Definition | Reading |
+|---|---|---|
+| `gap`, `gap_acc` | as in training | equals the gap logged at the checkpoint's step with the same samples and noise |
+| `bias` | $\overline{L(\text{base prompt}, j \text{ first})}_{j \ne k} - L(\text{base prompt}, k \text{ first})$ | > 0: target $k$ is favoured when input $k$ is first, without any designation |
+| `prompt_effect` | $L(\text{base}, k \text{ first}) - L(\text{designated } k)$ | `slot` only (same order, only the prompt differs) |
+| `bias_ratio` | `bias` / `gap` | < 0.2: the designation is followed; > 0.7: a position shortcut; ignore it while `gap` < 0.01 |
+
+Output (default `<checkpoint>/eval/`): `summary.json` (overall and per $\sigma$), `per_sample.csv`, and `rotation_<folder>.jpeg` for `--image-folders` (2) designated folders: per seed one row "no main, input $i$ first" and one row "main = input $i$". If the first row changes with the first input in the same way as the second row, the first position acts as the main image. With `tid` no position is special, so `bias` should stay at the base model's value.
+
+| Argument | Default | Description |
+|---|---|---|
+| `--checkpoint` | required | `checkpoint-XXXXXX` folder |
+| `--run-args` | `<checkpoint>/../args.json` | Settings of the run (fallback: `train_state.pt`) |
+| `--base-only` | off | Base model with the run's settings (no LoRA, no $E_{main}$) |
+| `--split` | `auto` | `auto` = the overfit subset for an overfitting run, else `val`; or `train`, `val`, `overfit` |
+| `--data-dir`, `--cache-dir` | the run's | Override the data location |
+| `--max-samples`, `--sigmas`, `--noises` | the run's `--gap-samples`, `--gap-sigmas`, `--gap-noises` | Designated samples, $\sigma$ values, noise draws |
+| `--image-folders`, `--image-seeds`, `--image-steps` | 2, 2, 28 | Rotation images (0 folders = none) |
+| `--output-dir` | `<checkpoint>/eval` | Output folder |
+
+### Parameters (`train_multiref.py`)
 
 | Argument | Default | Description |
 |---|---|---|
 | `--data-dir`, `--cache-dir`, `--output-dir` | `data/multiref`, `<data-dir>/cache`, `runs/multiref` | Manifests, cache, run folder |
-| `--unspec-schedule` | `0:1.0,0.3:1.0,0.4:0.65` (`0.5` with `--overfit`) | Probability of the unspecified pool over training progress |
+| `--unspec-schedule` | `0:1.0,0.3:1.0,0.4:0.65` (`0.5` with `--overfit`) | Probability of the unspecified pool over training progress (`progress:prob` points, linear in between; one value = constant) |
 | `--overfit` | 0 | Overfitting test on about N samples |
 | `--no-shuffle`, `--preload` | off | Fixed input order (debugging); keep all latents in memory |
-| `--role`, `--layout` | `embed`, `canvas` | Main-image designation; position ids of the references |
+| `--base-model` | `black-forest-labs/FLUX.1-Kontext-dev` | Transformer weights |
+| `--role` | `tid` | Main-image designation: `tid`, `embed`, `slot`, `index` |
+| `--main-t` | 2 | Position id $t$ of the main reference with `--role tid` (the others have 1) |
+| `--layout` | `canvas` | Position ids of the references (`per_t` not with `tid`) |
 | `--lora-rank`, `--lora-alpha`, `--lora-layers` | 32, = rank, see Defaults | LoRA configuration |
 | `--init-lora` | none | Start from LoRA weights with the same rank and layers |
 | `--guidance-scale` | 3.5 | Guidance embedding (use the same value at inference) |
 | `--max-steps`, `--grad-accum` | 10000, 4 | Optimizer steps, samples per step |
-| `--lr`, `--role-lr`, `--weight-decay`, `--warmup-steps`, `--max-grad-norm` | 1e-4, 1e-3, 1e-4, 500, 1.0 | Optimization |
-| `--weighting-scheme`, `--logit-mean`, `--logit-std` | `none`, 0, 1 | Timestep density |
+| `--lr`, `--role-lr`, `--weight-decay`, `--warmup-steps`, `--max-grad-norm` | 1e-4, 1e-3, 1e-4, 500, 1.0 | Optimization (`--role-lr` only for $E_{main}$) |
+| `--weighting-scheme`, `--logit-mean`, `--logit-std`, `--mode-scale` | `none`, 0, 1, 1.29 | Timestep density (diffusers); `logit_normal` with `--logit-mean` > 0 favours low $\sigma$ |
+| `--designated-sigma` | `same` | $\sigma$ of designated samples: as unspecified, or `logit_normal` (direct, $\mu > 0$ favours high $\sigma$) |
+| `--designated-sigma-mean`, `--designated-sigma-std` | 1.0, 1.0 | $\mu$, $s$ of `--designated-sigma logit_normal` |
+| `--seed` | 0 | Sampling, noise and overfit-subset seed |
 | `--log-every`, `--val-every`, `--val-samples` | 10, 500, 16 | Logging and validation loss |
+| `--gap-every`, `--gap-samples`, `--gap-sigmas`, `--gap-noises` | = `--val-every`, 8, `0.9,0.75,0.5,0.25`, 1 | Designation gap (0 = off) |
 | `--image-every`, `--image-folders`, `--image-steps`, `--no-images-at-start` | 1000, 3, 28, off | Sample images |
 | `--save-every`, `--resume`, `--tensorboard` | 1000, none, off | Checkpoints and logging |
 
@@ -704,9 +778,19 @@ What to check: the sample images approach the targets; for a designated folder t
 # base model (baseline)
 python generate_multi.py --folder data/no_main/<folder> --main 2
 
-# fine-tuned LoRA + role embedding (the same --role / --layout as in training)
-python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 \
+# fine-tuned LoRA (run trained with the default --role tid)
+python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 --lora runs/v1/checkpoint-010000/lora
+
+# run trained with --role embed: LoRA + role embedding
+python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 --role embed \
     --lora runs/v1/checkpoint-010000/lora --role-embedding runs/v1/checkpoint-010000/role_embedding.safetensors
+```
+
+`--role`, `--layout` and `--main-t` must be the ones of the training run (defaults `tid`, `canvas`, 2). **Main guidance** (`--main-guidance w`, `tid` / `embed`, needs `--main`): at every step with $\sigma \ge$ `--main-guidance-min-sigma` the transformer runs with and without the designation (no marker, base prompt) and uses $v = v_{none} + w\,(v_{main} - v_{none})$; $w = 1$ is off, several weights can be given (one output file each, `__mg{w}`), guided steps cost two forward passes. It amplifies a weak designation at high noise, where the composition is decided:
+
+```bash
+python generate_multi.py --folder <folder> --main 3 --lora runs/<run>/checkpoint-005000/lora \
+    --main-guidance 1 2 3 5 --main-guidance-min-sigma 0.5 --num-seeds 2 --output-dir outputs/main_guidance
 ```
 
 `--main k` is 1-based in the given order; without it no image is designated. Defaults: `--ref-size 512`, `--size 1024`, `--steps 28`, `--guidance-scale 3.5`, `--num-seeds 4`. Output (`--output-dir`, default `outputs/multi`): one image and one preview (inputs with the main framed in red, result, prompt) per seed, and a json with the prompt and the model order of the inputs.
@@ -714,18 +798,20 @@ python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 \
 ## Sanity checks (`check_multiref.py`)
 
 ```bash
-python check_multiref.py --folder data/no_main/<folder>   # all checks
-python check_multiref.py --skip-model                                      # check 0 only
+python check_multiref.py --folder data/no_main/<folder>                           # all checks
+python check_multiref.py --skip-model                                              # checks 0 and 0b only
+python check_multiref.py --folder data/no_main/<folder> --baseline-roles tid,slot --main-t 3
 ```
 
 | Check | Expected |
 |---|---|
 | 0 `canvas` tokens / ids equal the stock packing of width-concatenated latents (no weights needed) | PASS |
+| 0b `tid` marker: with a main reference only the $t$ id of its tokens becomes `--main-t`; tokens, spans and $(h, w)$ unchanged (no weights needed) | PASS |
 | 1 one reference: `generate_multi` equals the stock pipeline (reference and output at `--size`) | max diff 0 |
 | 2 two references: equals the stock pipeline with width-concatenated latents up to token order | small difference |
 | 3 $E_{main} = 0$: hook on equals hook off | max diff 0 |
 | 4 a random $E_{main}$ changes only the tokens of the main reference | PASS |
-| 5 baseline images of the base model (no main, each main, `per_t`) | `outputs/check_multiref/baseline_<folder>.jpeg` |
+| 5 baseline images of the base model: first row no main, "marked" prompt without marker, `per_t`; then one row per `--baseline-roles` (default `tid`) with each input as main | `outputs/check_multiref/baseline_<folder>.jpeg`; with `tid` all references should still be used (no image dropped, no unrelated object) |
 
 ---
 
@@ -764,21 +850,34 @@ A `Fatal Python error: PyGILState_Release` printed at interpreter exit comes fro
 - A subject subspace built from CLIP text embeddings does not work (modality gap: `proj_ratio` ≈ 0.17 on the phone image, and removing it left the phone unchanged). The prior-based image-space subspace (v7.1) is in the same space as $e$.
 - Weakening the subject in every input made small subjects (a kite) disappear from all inputs; v7.2 keeps the subject in one input instead.
 
-### Multi-reference fine-tuning (first overfitting test)
+### Multi-reference fine-tuning (overfitting tests)
 
-Setup: `--overfit 8` (one designated folder with 4 mains + 4 unspecified samples), 1500 steps, `--grad-accum 1`, pools 50 : 50, `--role embed`, default learning rates.
+All tests use `--overfit 8`: one designated folder with 4 mains (4 counterfactual samples) and 4 unspecified samples; validation and gap on the same samples, so the gap is measured on only 4 designated samples (`gap_acc` in steps of 0.25).
 
-| | Step 0 | Step 1500 |
+| Role | Setting | Result |
 |---|---|---|
-| `val_loss_unspecified` | 0.416 | 0.357 |
-| `val_loss_designated` | 0.475 | 0.445 |
-| `e_main_norm` | 0 | 1.05 |
+| `embed` | 1500 steps, pools 50 : 50, default learning rates | **Not learned.** "No main" and all four mains give the unspecified target; `val_loss_designated` 0.475 → 0.445. $E_{main}$ grows slowly (norm 0.25 at step 160, 1.05 at step 1500, long plateaus): a 3072-d vector of norm ≈ 1 is a small perturbation of the token states, so the model does not use it and $E_{main}$ gets no consistent gradient |
+| `index` | same subset | **Not learned** ("image k" in the prompt) |
+| `slot` | `--lr 3e-4 --unspec-schedule 0.3 --designated-sigma logit_normal`, 5000 steps | **Learned, through a shortcut.** `gap_s0.9` > 0.01 at about step 1000 and ≈ 0.12 at step 2000, but `eval_multiref.py` gave `bias_ratio` ≈ 0.97: the model favours whichever input is first, also without a designation |
+| **`tid`** | same as `slot` (`runs/overfit_tid_hs_long`) | **Learned, without moving the main image** (first-position bias still to be measured with `eval_multiref.py`). Details below |
 
-- **Combining the references works**: for the unspecified samples the sample images match the targets.
-- **The designation is not learned**: in the designated folder, "no main" and all four mains give the same image (the unspecified target), and the designated validation loss hardly decreases. The four mains share the prompt and the input order is shuffled, so $E_{main}$ is the only cue; it grows slowly (0.25 at step 160, 1.05 at step 1500, with long plateaus), i.e. its gradient has no consistent direction. A 3072-d vector of norm ≈ 1 is probably a small perturbation of the token states, so the model cannot use it, and therefore $E_{main}$ gets no consistent signal. The extra prompt sentence ("no main" vs "main") has no visible effect either.
-- The training loss printed every 10 steps is dominated by the random $\sigma$ and pool of each sample; only the fixed validation loss shows trends.
+`tid` run (`log.jsonl`):
 
-Running next: `--role slot` (designation by position, no $E_{main}$) and `--role-lr 1e-2` on the same subset.
+| Step | `gap` | `gap_s0.9` | `gap_s0.25` | `gap_acc` | `val_loss_designated` / `_unspecified` |
+|---|---|---|---|---|---|
+| 0 | ≈ 0 | ≈ 0 | ≈ 0 | 0.25 (chance) | 0.463 / 0.367 |
+| 250 – 1250 | < 0.0005 | < 0.0008 | ≈ 0 | 0.31 – 0.69 | 0.44 → 0.39 / ≈ 0.32 |
+| 1500 | 0.003 | 0.004 | 0.0005 | 0.94 | 0.344 / 0.304 |
+| 1750 | 0.018 | **0.051** | 0.002 | 0.94 | 0.308 / 0.289 |
+| 2000 – 5000 | 0.010 – 0.017 | 0.007 – 0.024 | 0.018 – 0.027 | **1.0** (every $\sigma$) | 0.25 → 0.045 / 0.28 → 0.144 |
+
+- **The base model ignores $t = 2$** (gap ≈ 0 at step 0); the LoRA learns the marker, about 1.5 times slower than `slot` (onset ≈ 1500 vs ≈ 1000 steps, i.e. ≈ 260 vs ≈ 175 draws of each designated sample).
+- **Weaker at high noise than `slot`**: `gap_s0.9` ≈ 0.009 at step 2000 vs ≈ 0.12 for `slot`. Part of the `slot` gap comes from the position shortcut, so the two are not directly comparable.
+- **The gap moves to low noise while the targets are memorized**: `gap_s0.9` peaks at step 1750 (0.051) and falls to 0.007 at step 5000, while `gap_s0.25` grows to ≈ 0.022. Late in the run the marker mostly recalls the details of a memorized target; the composition-level designation (high $\sigma$), which is what has to generalize, stays weak.
+- **Sample images at step 5000**: main = person and main = bird on the tower follow their targets; main = flowers is almost identical to "no main" (which already leans toward the flowers instead of the source composition); main = bust is a blurred **copy** of that input instead of its target. The unspecified folders reproduce their source images.
+- **High-noise sampling** (`--designated-sigma logit_normal`) learned the designation about twice as fast as uniform $\sigma$.
+- **Normal runs are undertrained**: with `--lr 1e-4`, 3000 steps and about 20 draws per designated sample, no gap appears; the data (20 sources, 14 designated folders, 1 designated validation folder) is also too small to measure generalization.
+- The training loss printed every 10 steps is dominated by the random $\sigma$ and pool of each sample; trends show only in the fixed validation loss and the gap.
 
 ### Fixed-K baseline
 
@@ -841,11 +940,12 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 
 ### Multi-reference fine-tuning (`train_multiref.py`)
 
-1. **Designation not learned yet** (see *Current findings*): with `--role embed` the role embedding stays too small to be used.
-2. **Quality gap between the pools.** Unspecified targets are real images, designated targets are Kandinsky images; the model could associate "designated" with the Kandinsky look. Compare the image quality of both modes on validation folders.
-3. **Single GPU only**; no multi-GPU or distributed training.
-4. **`--init-lora`** needs the same rank and target layers; the paper's AI-Toolkit LoRA may not match (the number of unexpected keys is printed).
-5. **Sample images are slow** (28 denoising steps per condition, ≈ 25 s per logging interval in which they are made); use `--no-images-at-start` or a larger `--image-every` for long runs.
+1. **Designation shown only on an overfitting subset** (see *Current findings*): with `tid` it is learned on one designated folder, mostly at low noise at the end; generalization is untested. `embed` and `index` did not learn it, `slot` learned a first-position shortcut.
+2. **Copying the main input.** In the `tid` overfitting test one main produced a copy of its input instead of its target; check the copy rate of a full run (`eval_multiref.py` rotation images, sample images).
+3. **Quality gap between the pools.** Unspecified targets are real images, designated targets are Kandinsky images; the model could associate "designated" with the Kandinsky look. Compare the image quality of both modes on validation folders.
+4. **Single GPU only**; no multi-GPU or distributed training.
+5. **`--init-lora`** needs the same rank and target layers; the paper's AI-Toolkit LoRA may not match (the number of unexpected keys is printed).
+6. **Sample images are slow** (28 denoising steps per condition, ≈ 25 s per logging interval in which they are made); use `--no-images-at-start` or a larger `--image-every` for long runs.
 
 ---
 
@@ -853,9 +953,10 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 
 ### Multi-reference fine-tuning
 
-1. **Make the designation learnable**: compare `--role slot` and `--role-lr 1e-2` with the first run on the same overfitting subset. If $E_{main}$ stays weak: initialize it at the scale of the token states, or mark the main reference through the position ids (axis 0) instead of a learned vector; log $\lVert E_{main}\rVert$ relative to the mean token norm of the main reference.
-2. **Full training run** with the pool schedule once the overfitting test shows that the images follow the designated main.
-3. **Evaluation script** (`eval_multiref.py`, planned): designation accuracy (`cos_main`, `margin` of the outputs), permutation invariance (same main, shuffled inputs), designation following (switching the main changes the output toward the new main), balance without a main (every input used), copy and collage detection.
+1. **First-position bias of `tid`**: `eval_multiref.py` on `runs/overfit_tid_hs_long/checkpoint-005000` and with `--base-only`; `bias_ratio` should stay well below 0.2.
+2. **Stronger high-noise signal** (optional, short overfitting runs to step 2000 compared on `gap_s0.9`): `--main-t 3`, or `tid` combined with $E_{main}$.
+3. **Full training run** on the extended data (`data/multiref_v2`: more sources, more designated folders, `--val-frac` ≥ 0.15 so that validation has several designated folders) with `tid` and `--designated-sigma logit_normal`; enough designated updates (more steps or a larger designated share than the default schedule), judged by the validation `gap_s0.9` and `gap_acc`.
+4. **Image-level evaluation** (extension of `eval_multiref.py`): designation accuracy on generated images (`cos_main`, `margin`), permutation invariance (same main, shuffled inputs), balance without a main (every input used), copy and collage detection.
 
 ### Adaptive decomposition
 

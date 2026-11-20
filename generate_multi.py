@@ -1,6 +1,8 @@
 """
 generate_multi.py -- combine 2-4 reference images with FLUX.1 Kontext, optionally with a main image.
-Last modified: 2026-11-19 (role mode "tid", --main-t)
+Last modified: 2026-11-20 (--main-guidance, --main-guidance-min-sigma: amplify the designation at inference)
+               2026-11-20 (default --role embed -> tid, as in train_multiref.py; tid needs --layout canvas)
+               2026-11-19 (role mode "tid", --main-t)
                2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
 
 Inputs are given either as a list of images (--images) or as a decomposition folder
@@ -8,26 +10,41 @@ Inputs are given either as a list of images (--images) or as a decomposition fol
 designates image k as the main object; without --main no image is designated.
 
 How the main image is designated (--role, must match the training run):
+    tid    (default) the main image keeps its position, its tokens get position id
+           t = --main-t (2 by default, as in training) instead of 1
     embed  the learnable role embedding E_main is added to the main image's tokens
            (load it with --role-embedding; without it E_main is zero and only the prompt
            differs between modes)
     slot   the main image is moved to the first position
     index  the main image is named in the prompt ("image k")
-    tid    the main image keeps its position, its tokens get position id t = --main-t
-           (2 by default, as in training) instead of 1
 
 The prompt is always one of the fixed templates in multiref/prompts.py.
+
+Main guidance (--main-guidance w, role modes tid / embed, needs --main)
+    At every step with sigma >= --main-guidance-min-sigma the model is run with and without the
+    designation and v = v_none + w * (v_main - v_none) is used (w = 1: off). It amplifies a weak
+    designation where the composition is decided (high sigma); guided steps cost two forward
+    passes. Several weights can be given; each gets its own output file (__mg{w}).
 
 Usage
 -----
     # base model, no fine-tuning (baseline)
     python generate_multi.py --folder generate_source/<name> --main 2
 
-    # fine-tuned LoRA + role embedding
+    # fine-tuned LoRA (default role tid)
     python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 \\
-        --lora runs/<run>/lora --role-embedding runs/<run>/role_embedding.safetensors
+        --lora runs/<run>/checkpoint-XXXXXX/lora
 
-Output (--output-dir): <prefix>__main{k|none}__seed{s}.jpeg and a preview with the inputs
+    # run trained with --role embed: LoRA + role embedding
+    python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 --role embed \\
+        --lora runs/<run>/checkpoint-XXXXXX/lora \\
+        --role-embedding runs/<run>/checkpoint-XXXXXX/role_embedding.safetensors
+
+    # main guidance: several weights, only at high noise
+    python generate_multi.py --folder <folder> --main 3 --lora runs/<run>/checkpoint-XXXXXX/lora \\
+        --main-guidance 1 2 3 5 --main-guidance-min-sigma 0.5 --num-seeds 2
+
+Output (--output-dir): <prefix>__main{k|none}[__mg{w}]__seed{s}.jpeg and a preview with the inputs
 (main image marked) next to the result, plus <prefix>__main{k|none}.json with the prompt
 and the model order of the inputs.
 """
@@ -50,7 +67,8 @@ def parse_args():
     src.add_argument("--images", type=Path, nargs="+", help="2-4 input images")
     src.add_argument("--folder", type=Path, help="Decomposition folder with input_0.jpeg, input_1.jpeg, ...")
     p.add_argument("--main", type=int, default=None, help="Main image, 1-based in the given order (default: none)")
-    p.add_argument("--role", choices=ROLE_MODES, default="embed", help="How the main image is designated")
+    p.add_argument("--role", choices=ROLE_MODES, default="tid",
+                   help="How the main image is designated (use the role of the training run)")
     p.add_argument("--layout", choices=LAYOUTS, default="canvas", help="Position ids of the references")
     p.add_argument("--main-t", type=float, default=MAIN_T, help="t id of the main image with --role tid")
     p.add_argument("--base-model", default="black-forest-labs/FLUX.1-Kontext-dev")
@@ -61,6 +79,10 @@ def parse_args():
     p.add_argument("--steps", type=int, default=28, help="Denoising steps")
     p.add_argument("--guidance-scale", type=float, default=3.5, help="Kontext guidance (use the training value)")
     p.add_argument("--prompt", default=None, help="Override the template prompt (for experiments only)")
+    p.add_argument("--main-guidance", type=float, nargs="+", default=[1.0],
+                   help="Main-guidance weight(s) w: v = v_none + w * (v_main - v_none); 1 = off")
+    p.add_argument("--main-guidance-min-sigma", type=float, default=0.0,
+                   help="Apply the main guidance only at steps with sigma >= this value (0 = every step)")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--num-seeds", type=int, default=4)
     p.add_argument("--output-dir", type=Path, default=Path("outputs/multi"))
@@ -98,6 +120,13 @@ def make_preview(inputs, main, output, prompt, tile=256):
 def main():
     args = parse_args()
 
+    if args.role == "tid" and args.layout != "canvas":
+        raise ValueError("--role tid needs --layout canvas")
+    guided = any(w != 1.0 for w in args.main_guidance)
+    if guided and args.main is None:
+        raise ValueError("--main-guidance needs --main")
+    if guided and args.role not in ("tid", "embed"):
+        raise ValueError("--main-guidance needs --role tid or embed")
     paths = list_inputs(args.folder) if args.folder else list(args.images)
     if not 2 <= len(paths) <= 4:
         raise ValueError(f"Expected 2-4 input images, got {len(paths)}.")
@@ -131,30 +160,39 @@ def main():
     prefix = args.folder.name if args.folder else "_x_".join(Path(p).stem for p in paths)
     tag = f"{prefix}__main{args.main if args.main is not None else 'none'}"
 
+    # one output per (guidance weight, seed); the weight is in the file name when guidance is used
+    show_mg = guided or len(args.main_guidance) > 1
     info = None
-    for i in range(args.num_seeds):
-        seed = args.seed + i
-        out_path = args.output_dir / f"{tag}__seed{seed:03d}.jpeg"
-        if out_path.exists() and not args.overwrite:
-            print(f"[skip] {out_path.name} exists")
-            continue
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-        out, info = pipe.generate_multi(
-            images, main=main_idx, role_mode=args.role, layout=args.layout, role_embedding=role,
-            ref_size=args.ref_size, height=args.size, width=args.size, prompt=args.prompt, main_t=args.main_t,
-            num_inference_steps=args.steps, guidance_scale=args.guidance_scale, generator=generator,
-        )
-        result = out.images[0]
-        result.save(out_path, quality=95)
-        make_preview(images, main_idx, result, info["prompt"]).save(
-            args.output_dir / f"{tag}__seed{seed:03d}_preview.jpeg", quality=92)
-        print(f"[{i + 1}/{args.num_seeds}] saved {out_path.name}")
+    for w in args.main_guidance:
+        wtag = f"{tag}__mg{w:g}" if show_mg else tag
+        for i in range(args.num_seeds):
+            seed = args.seed + i
+            out_path = args.output_dir / f"{wtag}__seed{seed:03d}.jpeg"
+            if out_path.exists() and not args.overwrite:
+                print(f"[skip] {out_path.name} exists")
+                continue
+            generator = torch.Generator(device="cuda").manual_seed(seed)
+            out, info = pipe.generate_multi(
+                images, main=main_idx, role_mode=args.role, layout=args.layout, role_embedding=role,
+                ref_size=args.ref_size, height=args.size, width=args.size, prompt=args.prompt, main_t=args.main_t,
+                main_guidance=w, main_guidance_min_sigma=args.main_guidance_min_sigma,
+                num_inference_steps=args.steps, guidance_scale=args.guidance_scale, generator=generator,
+            )
+            result = out.images[0]
+            result.save(out_path, quality=95)
+            caption = info["prompt"] + (f"\nmain guidance {w:g} (sigma >= {args.main_guidance_min_sigma:g})"
+                                        if show_mg else "")
+            make_preview(images, main_idx, result, caption).save(
+                args.output_dir / f"{wtag}__seed{seed:03d}_preview.jpeg", quality=92)
+            print(f"[mg {w:g}, {i + 1}/{args.num_seeds}] saved {out_path.name}")
 
     if info is not None:
         with open(args.output_dir / f"{tag}.json", "w") as f:
             json.dump({"inputs": [str(p) for p in paths], "main": args.main, "role": args.role,
                        "layout": args.layout, "main_t": args.main_t if args.role == "tid" else None,
                        "lora": args.lora,
+                       "main_guidance": args.main_guidance,
+                       "main_guidance_min_sigma": args.main_guidance_min_sigma,
                        "role_embedding": str(args.role_embedding) if args.role_embedding else None,
                        **info}, f, indent=2)
 
