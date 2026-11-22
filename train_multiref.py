@@ -1,6 +1,7 @@
 """
 train_multiref.py -- LoRA (+ main-image role embedding) fine-tuning of FLUX.1 Kontext dev with 2-4 references.
-Last modified: 2026-11-20 (default --role embed -> tid)
+Last modified: 2026-11-22 (default --main-t 2 -> 3, multiref.conditioning.MAIN_T)
+               2026-11-20 (default --role embed -> tid)
                2026-11-19 (role mode "tid": main image marked by position id t = --main-t)
 
 Data: manifests from build_dataset.py (train.jsonl, val.jsonl) and the cache from
@@ -24,9 +25,10 @@ diffusers example train_dreambooth_lora_flux_kontext.py where possible:
 
 Role modes (--role; how the main image is designated, see multiref/prompts.py)
     tid    (default) main image keeps its position, its tokens get position id t = --main-t
-           (2) instead of 1; without a main image all references have t = 1 (canvas layout
-           only). The base model does not react to t = 2, so the LoRA learns the marker from
-           scratch, but there is no position shortcut
+           (3; 2 before 2026-11-22) instead of 1; without a main image all references have
+           t = 1 (canvas layout only). The base model does not react to the marker, so the LoRA
+           learns it from scratch, but there is no position shortcut. t = 3 gave an about 3x
+           larger designation gap than t = 2 in the overfitting tests
     embed  learnable E_main added to the main image's tokens; order unchanged (E_main stayed
            too small to be used in the first overfitting test)
     slot   main image moved to the first position (learns "first input = main image" even
@@ -95,8 +97,9 @@ Usage
         --overfit 8 --max-steps 1500 --warmup-steps 50 --grad-accum 1 --role slot \\
         --designated-sigma logit_normal --val-every 100 --image-every 250 --save-every 500
 
-    # overfitting test, main image marked by position id t = 2 (same settings as overfit_slot_hs_long)
-    python train_multiref.py --data-dir data/multiref --output-dir runs/overfit_tid_hs_long \\
+    # overfitting test, main image marked by position id t = 3 (setting of runs/overfit_tid_t3)
+    python train_multiref.py --data-dir data/multiref --output-dir runs/overfit_tid_t3 \\
+        --role tid --main-t 3 \\
         --overfit 8 --max-steps 5000 --warmup-steps 50 --grad-accum 1 --lr 3e-4 \\
         --unspec-schedule 0.3 --designated-sigma logit_normal \\
         --val-every 250 --image-every 500 --save-every 1000

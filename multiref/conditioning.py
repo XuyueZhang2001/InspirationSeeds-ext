@@ -17,9 +17,13 @@ Position ids (t, h, w) of the reference tokens; the generated image always has t
 
 Main image (role mode "tid", canvas layout only)
     The main reference keeps its place on the canvas (same h, w ids) but gets t = main_t
-    (MAIN_T = 2 by default) instead of 1. The base model already distinguishes position ids,
-    so the marker is visible from the first step, and without a main image all references
-    have t = 1: no position is special, unlike role mode "slot" (main image moved first).
+    (MAIN_T = 3 by default since 2026-11-22; 2 before) instead of 1. Without a main image all
+    references have t = 1: no position is special, unlike role mode "slot" (main image moved
+    first). t is a continuous RoPE coordinate, not an embedding index, so skipping t = 2 leaves
+    nothing unused: only the offset to the other tokens matters. With t = 3 the extra rotation of
+    the main reference is twice that of t = 2 in every frequency pair of the t band, and in the
+    overfitting tests the designation gap was about 3x larger at step 5000 (README, Current
+    findings). Runs trained with another value must use the same --main-t at inference.
 
 Main image (role mode "embed")
     MainRoleEmbedding adds a learnable vector E_main to every token of the main reference
@@ -55,7 +59,7 @@ from safetensors.torch import load_file, save_file
 from .prompts import BASE, ROLE_MODES, arrange
 
 LAYOUTS = ("canvas", "per_t")
-MAIN_T = 2.0  # t id of the main reference in role mode "tid" (the other references have t = 1)
+MAIN_T = 3.0  # t id of the main reference in role mode "tid" (the other references have t = 1); 2.0 before 2026-11-22
 
 
 def marker_pos(role_mode: str, main_pos):

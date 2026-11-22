@@ -10,7 +10,7 @@ The long-term goal of this fork is to support **N input images with an optional 
 4. building the training data: **`build_dataset.py`** and **`cache_features.py`**;
 5. fine-tuning FLUX.1 Kontext dev (new LoRA; the main image is marked by its position id) on 2–4 reference images with an optional main image: **`train_multiref.py`**; evaluation with **`eval_multiref.py`**, inference with **`generate_multi.py`**.
 
-Last README update: 2026-11-20.
+Last README update: 2026-11-22.
 
 ---
 
@@ -30,7 +30,7 @@ Last README update: 2026-11-20.
 | **`select_targets.py`** | Suggests which synthesized targets to keep and writes review folders (`keep/`, `drop/`, `_overview.jpeg`) for the manual selection (see below) |
 | **`build_dataset.py`** | Training / validation manifests: unspecified samples (decomposition + source image) and designated samples (decomposition + kept targets) |
 | **`cache_features.py`** | Caches VAE latents (references 512 px, targets 1024 px) and the prompt embeddings, so training only needs the transformer |
-| **`train_multiref.py`** | LoRA fine-tuning of FLUX.1 Kontext dev with 2–4 references and an optional main image (default: marked by position id $t = 2$); pool schedule, designation gap, validation images, checkpoints, overfitting test |
+| **`train_multiref.py`** | LoRA fine-tuning of FLUX.1 Kontext dev with 2–4 references and an optional main image (default: marked by position id $t = 3$); pool schedule, designation gap, validation images, checkpoints, overfitting test |
 | **`eval_multiref.py`** | Designation gap and first-position bias of a checkpoint, with rotation images |
 | **`generate_multi.py`** | Inference with 2–4 images and an optional main image (`--main k`), with a trained LoRA (and role embedding for `--role embed`) |
 | `check_multiref.py` | Sanity checks of the multi-reference conditioning against the stock Kontext pipeline, plus baseline images of the base model |
@@ -70,7 +70,8 @@ python decompose_v7_2.py --image-dir $SRC --output-dir output/decompose/base_s1
 python decompose_v7_2.py --image-dir $SRC --output-dir output/decompose/c05 --clean-frac 0.5
 
 # 2. synthesis sources: automatic screening of data/no_main/ -> generate_source/screening/,
-#    then move the good folders to generate_source/ by hand (delete the others)
+#    then move the good folders to generate_source/ by hand (delete the others); prefer folders
+#    whose inputs show different subjects (see Target selection, Selection criteria)
 python screen_sources.py --dry-run          # report only, to check the thresholds
 python screen_sources.py
 
@@ -78,6 +79,7 @@ python screen_sources.py
 python synthesize_v2_1.py                   # generate_source -> data/synth
 
 # 4. suggestions + manual selection in data/selection/review/<folder>/main<k>/keep|drop
+#    (criteria: Target selection, Selection criteria)
 python select_targets.py                    # data/synth -> data/selection
 
 # 5. training data: manifests and cached latents / prompt embeddings
@@ -554,7 +556,21 @@ Nothing has to be recorded elsewhere: `build_dataset.py` reads the content of th
 
 Rerunning `select_targets.py` never changes `keep/` / `drop/` of an existing folder and never recreates a deleted one (listed in `_created.txt`); it only redraws `_overview.jpeg` (so `now` reflects your changes) and adds new folders. `--overwrite` rebuilds everything from the suggestions and discards all manual changes.
 
-What to look for: the main input dominates (shape or pose kept, category may change); the other inputs visibly contribute (material, color, elements); a fused object, not a collage; no structural artifacts; and the targets of different mains of one folder look different (otherwise they teach nothing about the designation). One or two good cells per main are better than four mediocre ones.
+### Selection criteria (designated targets)
+
+A designated target teaches the model "input $k$ is the main object". It only does so if the target can be attributed to input $k$ **alone**. Keep a cell only if all three hold:
+
+| Criterion | Meaning | Fails, for example |
+|---|---|---|
+| **① Recognizably the main input** | The main subject keeps the **visual identity** of input $k$ (shape, material, color, texture), not only its category | A bird-shaped statue becomes a real bird; a ceramic vase becomes a plain vase |
+| **② Not explained by another input** | No other input of the folder explains the target as well, in particular when two inputs share a category | Two inputs are birds (a statue and a bird on a tower): a target with real birds fits both |
+| **③ Not a copy** | The other inputs visibly contribute (background, material, color, elements); not the main input with a new background | The target is almost input $k$ itself |
+
+A change of the subject is fine as long as ① and ② hold: a bird with the statue's material and form, on a pedestal, is a good target for the statue; two real birds are not. Also check, as before: a fused object rather than a collage, no structural artifacts, and targets of different mains of one folder that look different (otherwise they teach nothing about the designation). One or two good cells per main are better than four mediocre ones; if no cell of a main passes, drop the main (the folder keeps its other mains).
+
+Why it matters: an ambiguous target is a noisy label that the model cannot resolve. In the overfitting tests (*Current findings*), the main whose kept target failed ① and ② (statue → real birds, with a second bird input in the folder) was the only one never learned: the model either copied the statue (the base model's default for that input) or produced the target of the other bird input; the three mains with clear targets were learned.
+
+Automatic hints: `margin` (criterion ②, cosine to the main minus the largest cosine to another input) and `cos_main` (criterion ③) of `suggestions.csv`. The default `--margin-min` (−0.15) is lenient and global CLIP features capture the category more than the identity, so criterion ① can only be checked by eye; look at folders with two inputs of the same category first. When choosing synthesis sources (`screen_sources.py`, step 2 of the pipeline), prefer folders whose inputs show different subjects: two inputs of one category make their targets ambiguous from the start.
 
 ### Usage and parameters
 
@@ -629,13 +645,14 @@ A new LoRA is trained on FLUX.1 Kontext dev (the paper's released LoRA is not us
 
   | Role mode | Order of the references | How the main image is marked | Prompt |
   |---|---|---|---|
-  | **`tid` (default)** | shuffled | position id $t$ = `--main-t` (2) instead of 1 for every token of the main reference; $h, w$ and the order unchanged (`canvas` only) | "… Use the marked image as the main object …" |
+  | **`tid` (default)** | shuffled | position id $t$ = `--main-t` (3) instead of 1 for every token of the main reference; $h, w$ and the order unchanged (`canvas` only) | "… Use the marked image as the main object …" |
   | `embed` | shuffled | learnable vector $E_{main}$ (3072-d, zero-initialized) added to every token of the main reference after `transformer.x_embedder` (forward hook) | "… Use the marked image as the main object …" |
   | `slot` | main first, others shuffled | position only | "… Use the first image as the main object …" |
   | `index` | shuffled | named in the prompt | "… Use image k as the main object …" |
 
   Without a main image, every mode uses the base prompt "Combine the elements in the reference images into a single object inspired by them." The generator only ever sees these fixed templates (`multiref/prompts.py`); free-form user text would be mapped to "main image k" or "none" beforehand. `tid` and `embed` share the same cached prompt.
-- **Why `tid` is the default.** Kontext already uses the $t$ axis of its 3-axis RoPE to tell the generated image ($t = 0$) from the context ($t = 1$). Moving the main reference to $t = 2$ rotates its queries and keys in the $t$ frequency band, so it changes the attention between the generated image and the main reference in every layer, without extra parameters (unlike `embed`, whose $E_{main}$ stayed too small to be used). The order of the references and their $(h, w)$ ids do not change, so, unlike `slot`, no position becomes "the main position", and a sample without a main image gives exactly the same input as before. The base model does not react to $t = 2$ (designation gap ≈ 0 at step 0, baseline images of `check_multiref.py`), so the LoRA has to learn the meaning of the marker. `tid` needs the `canvas` layout (`per_t` already uses $t$ for every reference). See *Current findings* for the overfitting tests of the four modes.
+- **Why `tid` is the default.** Kontext already uses the $t$ axis of its 3-axis RoPE to tell the generated image ($t = 0$) from the context ($t = 1$). Moving the main reference to $t$ = `--main-t` rotates its queries and keys in the $t$ frequency band, so it changes the attention between the generated image and the main reference in every layer, without extra parameters (unlike `embed`, whose $E_{main}$ stayed too small to be used). The order of the references and their $(h, w)$ ids do not change, so, unlike `slot`, no position becomes "the main position", and a sample without a main image gives exactly the same input as before. The base model does not react to the marker (designation gap ≈ 0 at step 0, baseline images of `check_multiref.py`), so the LoRA has to learn its meaning. `tid` needs the `canvas` layout (`per_t` already uses $t$ for every reference). See *Current findings* for the overfitting tests of the four modes.
+- **Why $t = 3$ (default since 2026-11-22; $t = 2$ before).** $t$ is a continuous RoPE coordinate, not an index into an embedding table, so skipping $t = 2$ leaves nothing unused: attention only depends on the offset $\Delta t$ between tokens. The 16 dimensions of the $t$ band form 8 rotation pairs with frequencies $\theta_i = 10000^{-2i/16}$ (1, 0.32, 0.1, …). Relative to an ordinary reference ($t = 1$), the main reference is rotated by an extra $(t_{main} - 1)\,\theta_i$: 1 rad / 0.32 rad / 0.1 rad in the three highest pairs with $t = 2$, twice that with $t = 3$, so the marker perturbs the attention more and is easier to learn; the main reference is also 2 instead of 1 away from the other references. Both values are equally unseen in pre-training (Kontext only uses $t \in \{0, 1\}$). In the overfitting tests $t = 3$ gave a 2–3 times larger designation gap from step 2000 on, a high-$\sigma$ gap that kept growing instead of fading, and a "no main" output that is no longer one of the designated targets (*Current findings*). Larger values are not necessarily better: the highest pair has a period of $2\pi$, so beyond $\Delta t \approx 3$ it wraps around. Runs trained with another value must use the same `--main-t` at inference (`generate_multi.py` reads it from the run when `--main-t` is not given).
 - **Pipeline.** `MultiRefKontextPipeline` overrides only `prepare_latents`, so that the injected reference tokens and ids are used instead of one encoded `image`. The output size must be passed together with `max_area = height × width` (the pipeline rescales the output to `max_area` otherwise); `generate_multi` does this.
 
 ### Training step
@@ -658,7 +675,7 @@ Batch 1, `--grad-accum` samples per optimizer step; as in the diffusers example 
 | Item | Default |
 |---|---|
 | Base model | `black-forest-labs/FLUX.1-Kontext-dev` transformer, bf16, gradient checkpointing |
-| Main image | `--role tid`, `--main-t 2`, `--layout canvas` |
+| Main image | `--role tid`, `--main-t 3`, `--layout canvas` |
 | LoRA | rank 32, alpha 32, on the Linear layers **inside** the transformer blocks: image and text attention, both feed-forwards of the double blocks, `proj_mlp` / `proj_out` of the single blocks (the final output projection, also named `proj_out`, is excluded); weights in fp32, forward in bf16 autocast |
 | $E_{main}$ | only with `--role embed`: zero init, own parameter group |
 | Optimizer | AdamW; LoRA lr 1e-4 (weight decay 1e-4), $E_{main}$ lr 1e-3 (no weight decay); 500 warmup steps, then constant; gradient clipping 1.0 |
@@ -691,16 +708,17 @@ python train_multiref.py --data-dir data/multiref --output-dir runs/overfit \
     --overfit 8 --max-steps 1500 --warmup-steps 50 --grad-accum 1 \
     --val-every 100 --image-every 250 --save-every 500
 
-# setting of the reference runs in *Current findings* (overfit_tid_hs_long, overfit_slot_hs_long)
-python train_multiref.py --data-dir data/multiref --output-dir runs/overfit_tid_hs_long \
+# setting of the reference runs in *Current findings* (overfit_tid_t3; overfit_tid_hs_long with --main-t 2)
+python train_multiref.py --data-dir data/multiref --output-dir runs/overfit_tid_t3 \
+    --role tid --main-t 3 \
     --overfit 8 --max-steps 5000 --warmup-steps 50 --grad-accum 1 --lr 3e-4 \
     --unspec-schedule 0.3 --designated-sigma logit_normal \
     --val-every 250 --image-every 500 --save-every 1000
 ```
 
 What to check:
-- `gap_acc` rises from chance (1 / number of inputs) to 1 and `gap` becomes clearly positive, **also at $\sigma$ = 0.9**; with the second command and `tid` this happened at about step 1500.
-- In the sample images of the designated folder, the images of the different mains differ and follow their own targets; "no main" follows the unspecified target; no main is a plain copy of its input.
+- `gap_acc` rises from chance (1 / number of inputs) to 1 and `gap` becomes clearly positive, **also at $\sigma$ = 0.9**; with the second command this happened at about step 1250 ($t = 3$; step 1500 with $t = 2$).
+- In the sample images of the designated folder, the images of the different mains differ and follow their own targets; "no main" follows the unspecified target; no main is a plain copy of its input. A main that keeps failing while the others work is often a target problem: check it against the *Selection criteria*.
 - `val_loss_designated` and `val_loss_unspecified` decrease (the designated loss can end lower, since the overfitting subset has one target per main).
 - Then run `eval_multiref.py` on the last checkpoint (below).
 
@@ -754,7 +772,7 @@ Output (default `<checkpoint>/eval/`): `summary.json` (overall and per $\sigma$)
 | `--no-shuffle`, `--preload` | off | Fixed input order (debugging); keep all latents in memory |
 | `--base-model` | `black-forest-labs/FLUX.1-Kontext-dev` | Transformer weights |
 | `--role` | `tid` | Main-image designation: `tid`, `embed`, `slot`, `index` |
-| `--main-t` | 2 | Position id $t$ of the main reference with `--role tid` (the others have 1) |
+| `--main-t` | 3 | Position id $t$ of the main reference with `--role tid` (the others have 1; 2 before 2026-11-22) |
 | `--layout` | `canvas` | Position ids of the references (`per_t` not with `tid`) |
 | `--lora-rank`, `--lora-alpha`, `--lora-layers` | 32, = rank, see Defaults | LoRA configuration |
 | `--init-lora` | none | Start from LoRA weights with the same rank and layers |
@@ -786,7 +804,7 @@ python generate_multi.py --images a.jpg b.jpg c.jpg --main 1 --role embed \
     --lora runs/v1/checkpoint-010000/lora --role-embedding runs/v1/checkpoint-010000/role_embedding.safetensors
 ```
 
-`--role`, `--layout` and `--main-t` must be the ones of the training run (defaults `tid`, `canvas`, 2). **Main guidance** (`--main-guidance w`, `tid` / `embed`, needs `--main`): at every step with $\sigma \ge$ `--main-guidance-min-sigma` the transformer runs with and without the designation (no marker, base prompt) and uses $v = v_{none} + w\,(v_{main} - v_{none})$; $w = 1$ is off, several weights can be given (one output file each, `__mg{w}`), guided steps cost two forward passes. It amplifies a weak designation at high noise, where the composition is decided:
+`--role`, `--layout` and `--main-t` must be the ones of the training run (defaults `tid`, `canvas`, 3). Without `--main-t` the value is read from the LoRA's run (`runs/<run>/args.json`), else 3; a mismatching `--role` or `--main-t` is reported. Runs trained before 2026-11-22 without `--main-t` used $t = 2$. **Main guidance** (`--main-guidance w`, `tid` / `embed`, needs `--main`): at every step with $\sigma \ge$ `--main-guidance-min-sigma` the transformer runs with and without the designation (no marker, base prompt) and uses $v = v_{none} + w\,(v_{main} - v_{none})$; $w = 1$ is off, several weights can be given (one output file each, `__mg{w}`), guided steps cost two forward passes. It amplifies a weak designation at high noise, where the composition is decided:
 
 ```bash
 python generate_multi.py --folder <folder> --main 3 --lora runs/<run>/checkpoint-005000/lora \
@@ -800,7 +818,7 @@ python generate_multi.py --folder <folder> --main 3 --lora runs/<run>/checkpoint
 ```bash
 python check_multiref.py --folder data/no_main/<folder>                           # all checks
 python check_multiref.py --skip-model                                              # checks 0 and 0b only
-python check_multiref.py --folder data/no_main/<folder> --baseline-roles tid,slot --main-t 3
+python check_multiref.py --folder data/no_main/<folder> --baseline-roles tid,slot --main-t 2
 ```
 
 | Check | Expected |
@@ -857,11 +875,13 @@ All tests use `--overfit 8`: one designated folder with 4 mains (4 counterfactua
 | Role | Setting | Result |
 |---|---|---|
 | `embed` | 1500 steps, pools 50 : 50, default learning rates | **Not learned.** "No main" and all four mains give the unspecified target; `val_loss_designated` 0.475 → 0.445. $E_{main}$ grows slowly (norm 0.25 at step 160, 1.05 at step 1500, long plateaus): a 3072-d vector of norm ≈ 1 is a small perturbation of the token states, so the model does not use it and $E_{main}$ gets no consistent gradient |
+| `embed` | `--lr 3e-4 --unspec-schedule 0.3 --designated-sigma logit_normal`, 2000 steps (`runs/overfit_embed_hs`) | **Learned in the loss** (`gap_acc` 1.0 at step 2000, `gap_s0.9` 0.005, `bias_ratio` 0.11); $E_{main}$ norm 4.6 (10 % of the token norm) and still growing. Not yet visible in the sample images. The first failure was mainly the setting (learning rate, steps, $\sigma$ density) |
 | `index` | same subset | **Not learned** ("image k" in the prompt) |
 | `slot` | `--lr 3e-4 --unspec-schedule 0.3 --designated-sigma logit_normal`, 5000 steps | **Learned, through a shortcut.** `gap_s0.9` > 0.01 at about step 1000 and ≈ 0.12 at step 2000, but `eval_multiref.py` gave `bias_ratio` ≈ 0.97: the model favours whichever input is first, also without a designation |
-| **`tid`** | same as `slot` (`runs/overfit_tid_hs_long`) | **Learned, without moving the main image** (first-position bias still to be measured with `eval_multiref.py`). Details below |
+| `tid`, $t = 2$ | same as `slot` (`runs/overfit_tid_hs_long`) | **Learned, without a position shortcut**: `bias` ≈ 0 as for the base model (`bias_ratio` −0.07 at step 5000), but weak at high noise |
+| **`tid`, $t = 3$** | same as `slot` (`runs/overfit_tid_t3`) | **Learned, 2–3 times stronger than $t = 2$**, also at high noise; current default. Details below |
 
-`tid` run (`log.jsonl`):
+`tid` with $t = 2$ (`log.jsonl`):
 
 | Step | `gap` | `gap_s0.9` | `gap_s0.25` | `gap_acc` | `val_loss_designated` / `_unspecified` |
 |---|---|---|---|---|---|
@@ -871,10 +891,26 @@ All tests use `--overfit 8`: one designated folder with 4 mains (4 counterfactua
 | 1750 | 0.018 | **0.051** | 0.002 | 0.94 | 0.308 / 0.289 |
 | 2000 – 5000 | 0.010 – 0.017 | 0.007 – 0.024 | 0.018 – 0.027 | **1.0** (every $\sigma$) | 0.25 → 0.045 / 0.28 → 0.144 |
 
-- **The base model ignores $t = 2$** (gap ≈ 0 at step 0); the LoRA learns the marker, about 1.5 times slower than `slot` (onset ≈ 1500 vs ≈ 1000 steps, i.e. ≈ 260 vs ≈ 175 draws of each designated sample).
+- **The base model ignores $t = 2$** (gap ≈ 0 at step 0; `eval_multiref.py --base-only`: gap and bias within ±0.002, which is the noise level of these metrics); the LoRA learns the marker, about 1.5 times slower than `slot` (onset ≈ 1500 vs ≈ 1000 steps, i.e. ≈ 260 vs ≈ 175 draws of each designated sample).
 - **Weaker at high noise than `slot`**: `gap_s0.9` ≈ 0.009 at step 2000 vs ≈ 0.12 for `slot`. Part of the `slot` gap comes from the position shortcut, so the two are not directly comparable.
 - **The gap moves to low noise while the targets are memorized**: `gap_s0.9` peaks at step 1750 (0.051) and falls to 0.007 at step 5000, while `gap_s0.25` grows to ≈ 0.022. Late in the run the marker mostly recalls the details of a memorized target; the composition-level designation (high $\sigma$), which is what has to generalize, stays weak.
 - **Sample images at step 5000**: main = person and main = bird on the tower follow their targets; main = flowers is almost identical to "no main" (which already leans toward the flowers instead of the source composition); main = bust is a blurred **copy** of that input instead of its target. The unspecified folders reproduce their source images.
+- **Main guidance** (`generate_multi.py --main-guidance`, step-2000 checkpoint of the $t = 3$ run, where the sample images do not yet differ) pulls each designated main toward its own target (layout and large structures first, the subject later): the learned direction is right, only weak at high noise.
+
+$t = 3$ against $t = 2$ (same subset, seed and settings; gap / `gap_s0.9` / `gap_s0.25`):
+
+| Step | $t = 2$ | $t = 3$ |
+|---|---|---|
+| 1250 | 0.0005 / 0.0008 / 0.0000 | 0.0015 / 0.0024 / 0.0001 |
+| 2000 | 0.0065 / 0.0089 / 0.0055 | 0.0110 / 0.0114 / 0.0107 |
+| 3000 | 0.0124 / 0.0101 / 0.0202 | 0.0299 / 0.0227 / 0.0534 |
+| 4000 | 0.0115 / 0.0131 / 0.0185 | 0.0261 / 0.0162 / 0.0547 |
+| 5000 | 0.0106 / 0.0067 / 0.0223 | 0.0320 / 0.0224 / 0.0622 |
+
+- **Stronger and earlier**: onset at ≈ 1250 instead of ≈ 1500 steps; from step 2000 on, the gap is larger at every one of the 13 evaluations (≈ 3× at step 5000). Relative to the designated loss, the gap at step 5000 is ≈ 60 % ($t = 3$) vs ≈ 25 % ($t = 2$). The validation losses are similar (unspecified slightly lower with $t = 3$).
+- **The high-$\sigma$ gap keeps growing** (0.011 → 0.022) instead of fading (0.012 → 0.007), so the composition-level designation is not displaced by memorization.
+- **Sample images at step 5000**: person, flowers and bird on the tower follow their targets with both values; "no main" gives the source composition with $t = 3$ but the flowers target with $t = 2$ (`gap_none` 0.022 vs 0.006): "no designation" became a separate condition.
+- **The statue main failed with both values** (a copy of the statue, or the other bird input's target). Its kept target fails the *Selection criteria* ① and ②: real birds instead of the statue, in a folder with a second bird input. This is a label problem, not a limit of the marker.
 - **High-noise sampling** (`--designated-sigma logit_normal`) learned the designation about twice as fast as uniform $\sigma$.
 - **Normal runs are undertrained**: with `--lr 1e-4`, 3000 steps and about 20 draws per designated sample, no gap appears; the data (20 sources, 14 designated folders, 1 designated validation folder) is also too small to measure generalization.
 - The training loss printed every 10 steps is dominated by the random $\sigma$ and pool of each sample; trends show only in the fixed validation loss and the gap.
@@ -940,8 +976,8 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 
 ### Multi-reference fine-tuning (`train_multiref.py`)
 
-1. **Designation shown only on an overfitting subset** (see *Current findings*): with `tid` it is learned on one designated folder, mostly at low noise at the end; generalization is untested. `embed` and `index` did not learn it, `slot` learned a first-position shortcut.
-2. **Copying the main input.** In the `tid` overfitting test one main produced a copy of its input instead of its target; check the copy rate of a full run (`eval_multiref.py` rotation images, sample images).
+1. **Designation shown only on an overfitting subset** (see *Current findings*): with `tid` ($t = 3$) it is learned on one designated folder (3 of 4 mains); generalization is untested. `index` did not learn it, `slot` learned a first-position shortcut, `embed` learned it more slowly.
+2. **Copying the main input.** Kontext tends to copy one reference (the base model copies the same input under every condition); when a designated target is ambiguous, the model falls back to that copy. Select targets by the *Selection criteria* and check the copy rate of a full run (`eval_multiref.py` rotation images, sample images).
 3. **Quality gap between the pools.** Unspecified targets are real images, designated targets are Kandinsky images; the model could associate "designated" with the Kandinsky look. Compare the image quality of both modes on validation folders.
 4. **Single GPU only**; no multi-GPU or distributed training.
 5. **`--init-lora`** needs the same rank and target layers; the paper's AI-Toolkit LoRA may not match (the number of unexpected keys is printed).
@@ -953,10 +989,10 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 
 ### Multi-reference fine-tuning
 
-1. **First-position bias of `tid`**: `eval_multiref.py` on `runs/overfit_tid_hs_long/checkpoint-005000` and with `--base-only`; `bias_ratio` should stay well below 0.2.
-2. **Stronger high-noise signal** (optional, short overfitting runs to step 2000 compared on `gap_s0.9`): `--main-t 3`, or `tid` combined with $E_{main}$.
-3. **Full training run** on the extended data (`data/multiref_v2`: more sources, more designated folders, `--val-frac` ≥ 0.15 so that validation has several designated folders) with `tid` and `--designated-sigma logit_normal`; enough designated updates (more steps or a larger designated share than the default schedule), judged by the validation `gap_s0.9` and `gap_acc`.
-4. **Image-level evaluation** (extension of `eval_multiref.py`): designation accuracy on generated images (`cos_main`, `margin`), permutation invariance (same main, shuffled inputs), balance without a main (every input used), copy and collage detection.
+1. **Review the designated targets by the *Selection criteria*** (in particular folders with two inputs of one category) before building `data/multiref_v2`.
+2. **Full training run** on the extended data (`data/multiref_v2`: more sources, more designated folders, `--val-frac` ≥ 0.15 so that validation has several designated folders) with `tid`, $t = 3$ and `--designated-sigma logit_normal`; enough designated updates (more steps or a larger designated share than the default schedule), judged by the validation `gap_s0.9` and `gap_acc`. `eval_multiref.py` on the final checkpoint: `bias_ratio` should stay well below 0.2.
+3. **Image-level evaluation** (extension of `eval_multiref.py`): designation accuracy on generated images (`cos_main`, `margin`), permutation invariance (same main, shuffled inputs), balance without a main (every input used), copy rate (output closer to the main input than to its target) and collage detection.
+4. **Optional**: $t = 4$, or `tid` combined with $E_{main}$, if the high-noise gap stays weak in the full run.
 
 ### Adaptive decomposition
 

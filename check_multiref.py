@@ -1,6 +1,7 @@
 """
 check_multiref.py -- sanity checks for multiref/conditioning.py (run once on the GPU server).
-Last modified: 2026-11-19 (check 0b: t marker of role mode "tid"; baseline rows per role mode, --main-t)
+Last modified: 2026-11-22 (default --main-t 3, multiref.conditioning.MAIN_T)
+               2026-11-19 (check 0b: t marker of role mode "tid"; baseline rows per role mode, --main-t)
                2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
 
 Checks
@@ -32,7 +33,7 @@ Usage
 -----
     python check_multiref.py --folder generate_source/<name>        # all checks
     python check_multiref.py --skip-model                               # checks 0 and 0b only
-    python check_multiref.py --folder generate_source/<name> --baseline-roles tid,slot --main-t 3
+    python check_multiref.py --folder generate_source/<name> --baseline-roles tid,slot --main-t 2
 """
 
 import argparse

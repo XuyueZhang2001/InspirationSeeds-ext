@@ -1,6 +1,7 @@
 """
 generate_multi.py -- combine 2-4 reference images with FLUX.1 Kontext, optionally with a main image.
-Last modified: 2026-11-20 (--main-guidance, --main-guidance-min-sigma: amplify the designation at inference)
+Last modified: 2026-11-22 (default --main-t 3; without --main-t the value of the LoRA's training run is used)
+               2026-11-20 (--main-guidance, --main-guidance-min-sigma: amplify the designation at inference)
                2026-11-20 (default --role embed -> tid, as in train_multiref.py; tid needs --layout canvas)
                2026-11-19 (role mode "tid", --main-t)
                2026-11-18 (paths without the hf_ prefix: generate_source, samples/sources, output/decompose/v72_final)
@@ -11,7 +12,9 @@ designates image k as the main object; without --main no image is designated.
 
 How the main image is designated (--role, must match the training run):
     tid    (default) the main image keeps its position, its tokens get position id
-           t = --main-t (2 by default, as in training) instead of 1
+           t = --main-t instead of 1. Without --main-t, the value is read from the training run
+           of --lora (runs/<run>/args.json next to checkpoint-XXXXXX/), else MAIN_T = 3.
+           Runs trained before 2026-11-22 without --main-t used t = 2
     embed  the learnable role embedding E_main is added to the main image's tokens
            (load it with --role-embedding; without it E_main is zero and only the prompt
            differs between modes)
@@ -70,7 +73,8 @@ def parse_args():
     p.add_argument("--role", choices=ROLE_MODES, default="tid",
                    help="How the main image is designated (use the role of the training run)")
     p.add_argument("--layout", choices=LAYOUTS, default="canvas", help="Position ids of the references")
-    p.add_argument("--main-t", type=float, default=MAIN_T, help="t id of the main image with --role tid")
+    p.add_argument("--main-t", type=float, default=None,
+                   help=f"t id of the main image with --role tid (default: the LoRA's training run, else {MAIN_T:g})")
     p.add_argument("--base-model", default="black-forest-labs/FLUX.1-Kontext-dev")
     p.add_argument("--lora", default=None, help="LoRA weights (local path or Hugging Face repo)")
     p.add_argument("--role-embedding", type=Path, default=None, help="role_embedding.safetensors (role 'embed')")
@@ -117,11 +121,39 @@ def make_preview(inputs, main, output, prompt, tile=256):
     return canvas
 
 
+def run_args_of_lora(lora):
+    """args.json of the training run of a local LoRA (runs/<run>/checkpoint-XXXXXX/lora), or None."""
+    if not lora:
+        return None
+    path = Path(lora)
+    for candidate in (path.parent.parent / "args.json", path.parent / "args.json"):
+        if candidate.is_file():
+            with open(candidate) as f:
+                return json.load(f)
+    return None
+
+
+def resolve_main_t(args):
+    """Fill args.main_t: explicit value > the LoRA's training run > MAIN_T. Warn about mismatches."""
+    run = run_args_of_lora(args.lora)
+    if run is not None and run.get("role") not in (None, args.role):
+        print(f"[warn] --role {args.role}, but the LoRA was trained with role {run.get('role')!r}")
+    run_t = run.get("main_t") if run is not None and run.get("role") == "tid" else None
+    if args.main_t is None:
+        args.main_t = float(run_t) if run_t is not None else MAIN_T
+        if args.role == "tid":
+            source = "training run" if run_t is not None else "default"
+            print(f"main t = {args.main_t:g} ({source})")
+    elif run_t is not None and float(run_t) != args.main_t:
+        print(f"[warn] --main-t {args.main_t:g}, but the LoRA was trained with main t = {float(run_t):g}")
+
+
 def main():
     args = parse_args()
 
     if args.role == "tid" and args.layout != "canvas":
         raise ValueError("--role tid needs --layout canvas")
+    resolve_main_t(args)
     guided = any(w != 1.0 for w in args.main_guidance)
     if guided and args.main is None:
         raise ValueError("--main-guidance needs --main")

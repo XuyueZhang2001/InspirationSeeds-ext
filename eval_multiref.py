@@ -1,12 +1,13 @@
 """
 eval_multiref.py -- designation gap and first-position bias of a train_multiref.py checkpoint.
-Last modified: 2026-11-19 (role mode "tid")
+Last modified: 2026-11-22 (docstring: default main t is 3; the run's own value is read from args.json)
+               2026-11-19 (role mode "tid")
 
 Question answered: when the model has learned to follow a designated main image, does it follow
 the DESIGNATION, or has it learned "the first input is the main image" regardless of the prompt?
 With --role slot the main image is always moved to the first position during training, so the
 second behaviour is a real risk. With --role tid the main image keeps its position (marked by
-t = 2) and no position is special without a designation, so the bias is expected to stay near
+t = --main-t of the run, read from args.json) and no position is special without a designation, so the bias is expected to stay near
 the base model's value; prompt_effect is not meaningful there (order and marker both change).
 
 Metrics (designated samples; per sample with main k, target_k, the same noise and sigma for
