@@ -726,7 +726,7 @@ The overfitting test only shows that the marker *can* carry the designation; it 
 
 ### Evaluation (`eval_multiref.py`)
 
-Measures, for a checkpoint, whether the model follows the **designation** or a position: a model trained with `slot` can learn "the first input is the main image" even without a designated main.
+Measures, for a checkpoint, whether the model follows the **designation** or a position (a model trained with `slot` can learn "the first input is the main image" even without a designated main), and whether a designation produces the target or a **copy** of the main input.
 
 ```bash
 # checkpoint (overfitting run: the overfit subset; normal run: the validation split)
@@ -738,6 +738,9 @@ python eval_multiref.py --checkpoint runs/<run>/checkpoint-005000 --base-only \
 
 # more validation samples of a normal run
 python eval_multiref.py --checkpoint runs/<run>/checkpoint-010000 --split val --max-samples 16
+
+# loss metrics only (no generated images, fast)
+python eval_multiref.py --checkpoint runs/<run>/checkpoint-005000 --copy-seeds 0 --image-folders 0
 ```
 
 The settings (role, layout, `--main-t`, LoRA, data, overfit subset, seed) are read from `runs/<run>/args.json`. For each designated sample (main $k$, same noise and $\sigma$ for every condition):
@@ -749,7 +752,19 @@ The settings (role, layout, `--main-t`, LoRA, data, overfit subset, seed) are re
 | `prompt_effect` | $L(\text{base}, k \text{ first}) - L(\text{designated } k)$ | `slot` only (same order, only the prompt differs) |
 | `bias_ratio` | `bias` / `gap` | < 0.2: the designation is followed; > 0.7: a position shortcut; ignore it while `gap` < 0.01 |
 
-Output (default `<checkpoint>/eval/`): `summary.json` (overall and per $\sigma$), `per_sample.csv`, and `rotation_<folder>.jpeg` for `--image-folders` (2) designated folders: per seed one row "no main, input $i$ first" and one row "main = input $i$". If the first row changes with the first input in the same way as the second row, the first position acts as the main image. With `tid` no position is special, so `bias` should stay at the base model's value.
+**Copy rate** (`--copy-seeds` > 0, on generated images). For every evaluated designated sample and seed, an image is generated with main $k$ designated (inputs in their original order), plus one image without a main per folder. After the transformer is unloaded, the images are compared with image-level CLIP features of the Kandinsky 2.2 prior (the features of `select_targets.py`):
+
+| Metric | Definition | Reading |
+|---|---|---|
+| `copy_rate` | share with $\cos(\text{out}, \text{input}_k) > \max_{T \in \text{targets}_k} \cos(\text{out}, T)$ | the output is closer to the main **input** than to its own **target**: the designation produced the input. Wanted: near 0 |
+| `near_copy_rate` | share with $\cos(\text{out}, \text{input}_k) \ge$ `--copy-max` (0.80, the copy threshold of `select_targets.py`) | near copies regardless of the target |
+| `input_acc` | share where input $k$ is the input most similar to the output (chance 1 / n inputs) | the main input dominates; together with a high `copy_rate`: "designated = copied" |
+| `target_acc` | share where target $k$ is more similar to the output than every target of the other mains (chance 1 / n mains) | image-level designation accuracy (folders with ≥ 2 mains) |
+| `near_copy_rate_no_main` | no-main images with $\max_j \cos(\text{out}, \text{input}_j) \ge$ `--copy-max` | one input copied although nothing is designated |
+
+`cos_target_input` (similarity of the kept target to its main input) is reported for reference: when it is itself high, outputs that follow the target are also close to the input. Compare with `--base-only`, which copies one reference under every condition. Per-main values are in `summary.json` (`copy.per_main`) and the console; `copy.csv` has one line per image, `copy_overview.jpeg` shows the images (red caption = copy) and `copy/` the generated images. With 8 designated samples and 2 seeds this generates about 20 images (≈ 28 denoising steps each); `--copy-seeds 0` skips it.
+
+Output (default `<checkpoint>/eval/`): `summary.json` (overall and per $\sigma$, copy metrics), `per_sample.csv`, `copy.csv`, `copy_overview.jpeg`, and `rotation_<folder>.jpeg` for `--image-folders` (2) designated folders: per seed one row "no main, input $i$ first" and one row "main = input $i$". If the first row changes with the first input in the same way as the second row, the first position acts as the main image. With `tid` no position is special, so `bias` should stay at the base model's value.
 
 | Argument | Default | Description |
 |---|---|---|
@@ -759,7 +774,8 @@ Output (default `<checkpoint>/eval/`): `summary.json` (overall and per $\sigma$)
 | `--split` | `auto` | `auto` = the overfit subset for an overfitting run, else `val`; or `train`, `val`, `overfit` |
 | `--data-dir`, `--cache-dir` | the run's | Override the data location |
 | `--max-samples`, `--sigmas`, `--noises` | the run's `--gap-samples`, `--gap-sigmas`, `--gap-noises` | Designated samples, $\sigma$ values, noise draws |
-| `--image-folders`, `--image-seeds`, `--image-steps` | 2, 2, 28 | Rotation images (0 folders = none) |
+| `--image-folders`, `--image-seeds`, `--image-steps` | 2, 2, 28 | Rotation images (0 folders = none); `--image-steps` also for the copy images |
+| `--copy-seeds`, `--copy-max` | 2, 0.80 | Seeds per designated sample for the copy rate (0 = none); near-copy threshold |
 | `--output-dir` | `<checkpoint>/eval` | Output folder |
 
 ### Parameters (`train_multiref.py`)
@@ -977,7 +993,7 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 ### Multi-reference fine-tuning (`train_multiref.py`)
 
 1. **Designation shown only on an overfitting subset** (see *Current findings*): with `tid` ($t = 3$) it is learned on one designated folder (3 of 4 mains); generalization is untested. `index` did not learn it, `slot` learned a first-position shortcut, `embed` learned it more slowly.
-2. **Copying the main input.** Kontext tends to copy one reference (the base model copies the same input under every condition); when a designated target is ambiguous, the model falls back to that copy. Select targets by the *Selection criteria* and check the copy rate of a full run (`eval_multiref.py` rotation images, sample images).
+2. **Copying the main input.** Kontext tends to copy one reference (the base model copies the same input under every condition); when a designated target is ambiguous, the model falls back to that copy. Select targets by the *Selection criteria* and check the copy rate of a full run (`eval_multiref.py`: `copy_rate`, `copy_overview.jpeg`).
 3. **Quality gap between the pools.** Unspecified targets are real images, designated targets are Kandinsky images; the model could associate "designated" with the Kandinsky look. Compare the image quality of both modes on validation folders.
 4. **Single GPU only**; no multi-GPU or distributed training.
 5. **`--init-lora`** needs the same rank and target layers; the paper's AI-Toolkit LoRA may not match (the number of unexpected keys is printed).
@@ -991,7 +1007,7 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 
 1. **Review the designated targets by the *Selection criteria*** (in particular folders with two inputs of one category) before building `data/multiref_v2`.
 2. **Full training run** on the extended data (`data/multiref_v2`: more sources, more designated folders, `--val-frac` ≥ 0.15 so that validation has several designated folders) with `tid`, $t = 3$ and `--designated-sigma logit_normal`; enough designated updates (more steps or a larger designated share than the default schedule), judged by the validation `gap_s0.9` and `gap_acc`. `eval_multiref.py` on the final checkpoint: `bias_ratio` should stay well below 0.2.
-3. **Image-level evaluation** (extension of `eval_multiref.py`): designation accuracy on generated images (`cos_main`, `margin`), permutation invariance (same main, shuffled inputs), balance without a main (every input used), copy rate (output closer to the main input than to its target) and collage detection.
+3. **Image-level evaluation**: copy rate, `input_acc` and `target_acc` are in `eval_multiref.py`; still missing: permutation invariance (same main, shuffled inputs), balance without a main (every input used) and collage detection.
 4. **Optional**: $t = 4$, or `tid` combined with $E_{main}$, if the high-noise gap stays weak in the full run.
 
 ### Adaptive decomposition

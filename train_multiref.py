@@ -1,6 +1,6 @@
 """
 train_multiref.py -- LoRA (+ main-image role embedding) fine-tuning of FLUX.1 Kontext dev with 2-4 references.
-Last modified: 2026-11-22 (default --main-t 2 -> 3, multiref.conditioning.MAIN_T)
+Last modified: 2026-11-22 (--overfit-folders: overfitting test on named folders; default --main-t 2 -> 3)
                2026-11-20 (default --role embed -> tid)
                2026-11-19 (role mode "tid": main image marked by position id t = --main-t)
 
@@ -81,7 +81,9 @@ Checkpoints (every --save-every steps and at the end): <output-dir>/checkpoint-X
 Overfitting test
     --overfit N trains on a fixed subset of about N training samples (whole designated folders
     with their counterfactual mains, plus unspecified samples), one target per main, and uses
-    the same subset for validation. The flow-matching loss drops only slowly even when samples
+    the same subset for validation. --overfit-folders names the folders explicitly (from the
+    train or val split), so that a test can be repeated on the same folders after the dataset
+    changed. The flow-matching loss drops only slowly even when samples
     are memorized; judge by the sample images (they should approach the targets) and by the
     designation gap (it should grow, mainly at high sigma).
 
@@ -173,6 +175,9 @@ def parse_args():
                    help=f"Probability of the unspecified pool over training progress (default {DEFAULT_SCHEDULE}; "
                         f"with --overfit {OVERFIT_SCHEDULE})")
     g.add_argument("--overfit", type=int, default=0, help="Overfitting test on about N fixed training samples")
+    g.add_argument("--overfit-folders", default=None,
+                   help="Comma-separated folder names for --overfit (all their mains and unspecified samples, "
+                        "train and val split), filled up with random unspecified samples to N")
     g.add_argument("--no-shuffle", action="store_true", help="Keep the input order fixed (debugging)")
     g.add_argument("--preload", action="store_true", help="Keep all cached latents in memory")
 
@@ -571,7 +576,9 @@ def main():
     train_rows = load_rows(args.data_dir, "train")
     val_rows = load_rows(args.data_dir, "val")
     if args.overfit:
-        train_rows = pick_overfit_rows(train_rows, args.overfit, seed=args.seed)
+        names = [x.strip() for x in (args.overfit_folders or "").split(",") if x.strip()]
+        pool = train_rows + val_rows if names else train_rows
+        train_rows = pick_overfit_rows(pool, args.overfit, seed=args.seed, folders=names or None)
         val_rows = train_rows
         print("overfitting test on: " + ", ".join(r["id"] for r in train_rows))
     if not train_rows:

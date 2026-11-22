@@ -167,13 +167,19 @@ def load_rows(data_dir, split: str):
     return read_jsonl(path) if path.exists() else []
 
 
-def pick_overfit_rows(rows, n: int, seed: int = 0):
+def pick_overfit_rows(rows, n: int, seed: int = 0, folders=None):
     """Small fixed subset for the overfitting test.
 
     Takes whole designated folders (all their mains, so counterfactual pairs are included) with
     the most mains first, until about half of n; fills the rest with unspecified samples, first
     those of the same folders. Every designated row keeps only its first target, so the
     mapping inputs -> target is deterministic.
+
+    folders: optional list of folder names (last path component, e.g. "104_topk64_nmax4").
+    Then every designated row of these folders is taken (in the given order, without the n / 2
+    limit), followed by the unspecified rows of these folders, and the rest is filled with
+    random unspecified rows of other folders up to n. Used to repeat a test on the same folders
+    after the dataset changed (rebuild, dropped targets), which would change the automatic choice.
     """
     rng = random.Random(seed)
     desig = defaultdict(list)
@@ -183,7 +189,21 @@ def pick_overfit_rows(rows, n: int, seed: int = 0):
             desig[r["folder"]].append(r)
         else:
             unspec[r["folder"]] = r
-    picked, folders = [], []
+    picked, chosen = [], []
+    if folders:
+        by_name = {Path(f).name: f for f in set(desig) | set(unspec)}
+        missing = [name for name in folders if name not in by_name]
+        if missing:
+            raise ValueError(f"--overfit-folders not found in the data: {', '.join(missing)}")
+        chosen = [by_name[name] for name in folders]
+        for folder in chosen:
+            for r in sorted(desig.get(folder, []), key=lambda r: r["main"]):
+                picked.append(dict(r, targets=r["targets"][:1]))
+        rest = [unspec[f] for f in chosen if f in unspec]
+        others = [r for f, r in sorted(unspec.items()) if f not in chosen]
+        rng.shuffle(others)
+        return picked + (rest + others)[: max(0, n - len(picked))]
+    folders = chosen
     for folder in sorted(desig, key=lambda f: (-len(desig[f]), f)):
         if len(picked) >= n // 2:
             break

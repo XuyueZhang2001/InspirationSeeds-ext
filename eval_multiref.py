@@ -1,6 +1,6 @@
 """
 eval_multiref.py -- designation gap and first-position bias of a train_multiref.py checkpoint.
-Last modified: 2026-11-22 (docstring: default main t is 3; the run's own value is read from args.json)
+Last modified: 2026-11-22 (copy rate on generated images, --copy-seeds, --copy-max; --overfit-folders honoured)
                2026-11-19 (role mode "tid")
 
 Question answered: when the model has learned to follow a designated main image, does it follow
@@ -37,6 +37,28 @@ every condition; references shuffled once with the same seed as in training)
     With the same samples, sigmas and noise draws as the training run, the gap printed here
     equals the gap logged at the checkpoint's step (sanity check of the evaluation).
 
+Copy rate (--copy-seeds > 0, on generated images)
+    For every evaluated designated sample (main k) and --copy-seeds seeds, an image is generated
+    with main k designated (inputs in their original order), and for every folder one image
+    without a main. Image-level CLIP features of the Kandinsky 2.2 prior (the encoder of
+    synthesize_v2_1.py / select_targets.py) are compared after the transformer is unloaded:
+        cos_main     cos(output, input_k)
+        cos_target   max over the kept targets of main k of cos(output, target)
+        copy         cos_main > cos_target: the output is closer to the main INPUT than to its
+                     own TARGET, i.e. the designation produced (a variant of) the input
+        near_copy    cos_main >= --copy-max (0.80, the copy threshold of select_targets.py)
+        input_hit    input k is the input most similar to the output (chance 1 / n inputs):
+                     the main input dominates
+        target_hit   target k is more similar to the output than every target of the other
+                     mains of the folder (chance 1 / n mains; folders with >= 2 mains): the
+                     image follows the designation, not only the loss
+        no main      near_copy_none: max_j cos(output, input_j) >= --copy-max (one input copied
+                     although no main is designated)
+    Reading: copy_rate near 0 and target_acc near 1 is the wanted behaviour. A high copy_rate
+    together with a high input_acc means "designated = copied". Compare with --base-only: the
+    base model copies one reference under every condition.
+    -> copy.csv (one line per image), copy_overview.jpeg, generated images in copy/
+
 Rotation images (--image-folders > 0)
     For a few designated folders: inputs and targets, then for every seed one row
     "no main, input i first" (base prompt, input i moved first, the others in their original
@@ -46,8 +68,9 @@ Rotation images (--image-folders > 0)
     -> <output-dir>/rotation_<folder>.jpeg
 
 Output (default <checkpoint>/eval)
-    summary.json     metrics overall and per sigma, settings
+    summary.json     metrics overall and per sigma, copy metrics, settings
     per_sample.csv   one line per sample, sigma and noise draw
+    copy.csv, copy_overview.jpeg, copy/   copy rate (see above)
     rotation_*.jpeg  rotation images
 
 Usage
@@ -62,12 +85,16 @@ Usage
     # validation split of a normal run, more samples
     python eval_multiref.py --checkpoint runs/v0_slot_hs/checkpoint-003000 --split val --max-samples 16
 
+    # loss metrics only (no generated images)
+    python eval_multiref.py --checkpoint runs/<run>/checkpoint-005000 --copy-seeds 0 --image-folders 0
+
 Settings (role, layout, LoRA, data, overfit subset, seed) are read from <run>/args.json, the
 file train_multiref.py writes next to the checkpoints.
 """
 
 import argparse
 import csv
+import gc
 import json
 import random
 from collections import defaultdict
@@ -84,6 +111,8 @@ from train_multiref import DEVICE, DTYPE, build_transformer, forward_loss
 
 # fields of the training args that are paths
 PATH_ARGS = ("data_dir", "cache_dir", "output_dir", "resume")
+# image encoder for the copy rate (same features as synthesize_v2_1.py / select_targets.py)
+CLIP_PRIOR = "kandinsky-community/kandinsky-2-2-prior"
 
 
 # --------------------------------------------------------------------------------------
@@ -104,7 +133,11 @@ def parse_args():
     p.add_argument("--noises", type=int, default=None, help="Noise draws per sigma (default: the run's --gap-noises, else 1)")
     p.add_argument("--image-folders", type=int, default=2, help="Designated folders with rotation images (0 = none)")
     p.add_argument("--image-seeds", type=int, default=2, help="Seeds per rotation image")
-    p.add_argument("--image-steps", type=int, default=28, help="Denoising steps of the rotation images")
+    p.add_argument("--image-steps", type=int, default=28, help="Denoising steps of the rotation / copy images")
+    p.add_argument("--copy-seeds", type=int, default=2,
+                   help="Seeds per designated sample for the copy rate (0 = no copy rate)")
+    p.add_argument("--copy-max", type=float, default=0.80,
+                   help="near_copy threshold of cos(output, main input) (select_targets.py --copy-max)")
     p.add_argument("--output-dir", type=Path, default=None, help="Default: <checkpoint>/eval")
     return p.parse_args()
 
@@ -139,7 +172,9 @@ def select_rows(run, split):
     if split == "overfit":
         if not run.overfit:
             raise ValueError("--split overfit needs a run trained with --overfit")
-        return pick_overfit_rows(load_rows(run.data_dir, "train"), run.overfit, seed=run.seed), "overfit"
+        names = [x.strip() for x in (getattr(run, "overfit_folders", None) or "").split(",") if x.strip()]
+        pool = load_rows(run.data_dir, "train") + (load_rows(run.data_dir, "val") if names else [])
+        return pick_overfit_rows(pool, run.overfit, seed=run.seed, folders=names or None), "overfit"
     rows = load_rows(run.data_dir, split)
     if not rows:
         raise ValueError(f"No samples in {run.data_dir}/{split}.jsonl")
@@ -259,10 +294,40 @@ def verdict(summary):
 # --------------------------------------------------------------------------------------
 # Rotation images
 # --------------------------------------------------------------------------------------
-@torch.no_grad()
-def rotation_images(pipe, role, by_folder, folders, store, run, args, out_dir):
-    pipe.transformer.eval()
+def make_generator(pipe, role, store, run, args):
+    """generate(inputs, order, main_pos, prompt_key, seed) -> PIL image, memoized (the copy rate
+    and the rotation images share the designated images)."""
+    memo = {}
     size = store.target_size
+
+    @torch.no_grad()
+    def generate(inputs, order, main_pos, key, seed):
+        mk = (tuple(inputs), tuple(order), main_pos, key, seed)
+        if mk not in memo:
+            pipe.transformer.eval()
+            refs = [store.ref(inputs[i]).unsqueeze(0).to(DEVICE, DTYPE) for i in order]
+            pr = store.prompt(key)
+            with torch.autocast("cuda", dtype=DTYPE):
+                out = pipe.generate_from_latents(
+                    refs, main_pos, run.role, run.layout, role, height=size, width=size,
+                    main_t=getattr(run, "main_t", MAIN_T), prompt_embeds=pr["prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
+                    pooled_prompt_embeds=pr["pooled_prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
+                    num_inference_steps=args.image_steps, guidance_scale=run.guidance_scale,
+                    generator=torch.Generator(device=DEVICE).manual_seed(seed))
+            memo[mk] = out.images[0]
+        return memo[mk]
+
+    return generate
+
+
+def designated_image(generate, inputs, k, run, seed):
+    """Image with input k designated, inputs in their original order (as in generate_multi.py)."""
+    order, main_pos, _ = arrange(len(inputs), k, run.role, shuffle=False)
+    return generate(inputs, order, main_pos, prompt_key(main_pos, run.role), seed)
+
+
+@torch.no_grad()
+def rotation_images(generate, by_folder, folders, run, args, out_dir):
     try:
         font = ImageFont.load_default(size=13)
     except TypeError:  # older Pillow
@@ -274,31 +339,15 @@ def rotation_images(pipe, role, by_folder, folders, store, run, args, out_dir):
         n = len(inputs)
         mains = {r["main"]: r for r in rows}
 
-        def generate(order, main_pos, key, seed):
-            refs = [store.ref(inputs[i]).unsqueeze(0).to(DEVICE, DTYPE) for i in order]
-            pr = store.prompt(key)
-            with torch.autocast("cuda", dtype=DTYPE):
-                out = pipe.generate_from_latents(
-                    refs, main_pos, run.role, run.layout, role, height=size, width=size,
-                    main_t=getattr(run, "main_t", MAIN_T), prompt_embeds=pr["prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
-                    pooled_prompt_embeds=pr["pooled_prompt_embeds"].unsqueeze(0).to(DEVICE, DTYPE),
-                    num_inference_steps=args.image_steps, guidance_scale=run.guidance_scale,
-                    generator=torch.Generator(device=DEVICE).manual_seed(seed))
-            return out.images[0]
-
         grid = [[(Image.open(p).convert("RGB"), f"input_{i}") for i, p in enumerate(inputs)]]
         grid.append([(Image.open(mains[i]["targets"][0]).convert("RGB"), f"target, main = input_{i}")
                      if i in mains else None for i in range(n)])
         for s in range(args.image_seeds):
             seed = run.seed + s
-            grid.append([(generate(first(list(range(n)), i), None, "base", seed),
+            grid.append([(generate(inputs, first(list(range(n)), i), None, "base", seed),
                           f"no main, input_{i} first (seed {seed})") for i in range(n)])
-            row = []
-            for i in range(n):
-                order, main_pos, _ = arrange(n, i, run.role, shuffle=False)
-                row.append((generate(order, main_pos, prompt_key(main_pos, run.role), seed),
-                            f"main = input_{i} (seed {seed})"))
-            grid.append(row)
+            grid.append([(designated_image(generate, inputs, i, run, seed), f"main = input_{i} (seed {seed})")
+                         for i in range(n)])
 
         tile, gap, cap = 256, 6, 20
         W = gap + n * (tile + gap)
@@ -322,6 +371,162 @@ def rotation_images(pipe, role, by_folder, folders, store, run, args, out_dir):
         paths.append(path)
         print(f"  rotation images: {path}")
     return paths
+
+
+# --------------------------------------------------------------------------------------
+# Copy rate
+# --------------------------------------------------------------------------------------
+def generate_copy_images(generate, picked, run, args, out_dir):
+    """Designated images of every picked sample and no-main images of every folder, saved to copy/.
+
+    Returns a list of entries {kind, row or folder rows, seed, path}.
+    """
+    img_dir = out_dir / "copy"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    entries = []
+    seeds = [run.seed + s for s in range(args.copy_seeds)]
+    folders = list(dict.fromkeys(r["folder"] for r in picked))
+    for folder in folders:
+        rows = sorted([r for r in picked if r["folder"] == folder], key=lambda r: r["main"])
+        inputs = rows[0]["inputs"]
+        name = Path(folder).name
+        for seed in seeds:
+            img = generate(inputs, list(range(len(inputs))), None, "base", seed)
+            path = img_dir / f"{name}__none__seed{seed}.jpeg"
+            img.save(path, quality=92)
+            entries.append({"kind": "none", "folder": folder, "inputs": inputs, "seed": seed, "path": path})
+            for row in rows:
+                img = designated_image(generate, inputs, row["main"], run, seed)
+                path = img_dir / f"{name}__main{row['main']}__seed{seed}.jpeg"
+                img.save(path, quality=92)
+                entries.append({"kind": "main", "folder": folder, "inputs": inputs, "row": row, "seed": seed,
+                                "path": path})
+        print(f"  copy images: {name} done")
+    return entries
+
+
+class ClipImageFeatures:
+    """Normalized image embeddings of the Kandinsky 2.2 prior's CLIP image encoder (cached per path)."""
+
+    def __init__(self, device=DEVICE):
+        from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+        self.device = device
+        self.proc = CLIPImageProcessor.from_pretrained(CLIP_PRIOR, subfolder="image_processor")
+        self.model = CLIPVisionModelWithProjection.from_pretrained(
+            CLIP_PRIOR, subfolder="image_encoder", torch_dtype=torch.float16).to(device).eval()
+        self.cache = {}
+
+    @torch.no_grad()
+    def __call__(self, path):
+        key = str(path)
+        if key not in self.cache:
+            px = self.proc(Image.open(path).convert("RGB"), return_tensors="pt").pixel_values
+            emb = self.model(px.to(self.device, torch.float16)).image_embeds.float()[0]
+            self.cache[key] = torch.nn.functional.normalize(emb, dim=-1).cpu()
+        return self.cache[key]
+
+
+def score_copy(entries, by_folder, clip, args):
+    """One record per generated image (see the module docstring)."""
+    cos = lambda a, b: float(a @ b)
+    records = []
+    for e in entries:
+        out = clip(e["path"])
+        cos_inputs = [cos(out, clip(p)) for p in e["inputs"]]
+        best_input = max(range(len(cos_inputs)), key=lambda j: cos_inputs[j])
+        rec = {"image": e["path"].name, "folder": Path(e["folder"]).name, "kind": e["kind"], "seed": e["seed"],
+               "n_inputs": len(cos_inputs), "best_input": best_input, "cos_best_input": max(cos_inputs)}
+        if e["kind"] == "none":
+            rec["near_copy"] = float(max(cos_inputs) >= args.copy_max)
+            records.append(rec)
+            continue
+        row, k = e["row"], e["row"]["main"]
+        cos_targets = [cos(out, clip(t)) for t in row["targets"]]
+        cos_target_input = max(cos(clip(t), clip(e["inputs"][k])) for t in row["targets"])
+        others = [r for r in by_folder[e["folder"]] if r["main"] != k]
+        cos_other_targets = [max(cos(out, clip(t)) for t in r["targets"]) for r in others]
+        rec.update({
+            "main": k, "cos_main": cos_inputs[k], "cos_target": max(cos_targets),
+            "cos_target_input": cos_target_input,
+            "copy": float(cos_inputs[k] > max(cos_targets)),
+            "near_copy": float(cos_inputs[k] >= args.copy_max),
+            "input_hit": float(best_input == k),
+            "n_mains": len(others) + 1,
+            "target_hit": float(max(cos_targets) > max(cos_other_targets)) if others else None,
+        })
+        records.append(rec)
+    return records
+
+
+def summarize_copy(records):
+    mains = [r for r in records if r["kind"] == "main"]
+    none = [r for r in records if r["kind"] == "none"]
+    mean = lambda rs, key: sum(r[key] for r in rs) / len(rs) if rs else None
+    with_targets = [r for r in mains if r["target_hit"] is not None]
+    return {
+        "n_designated_images": len(mains),
+        "copy_rate": mean(mains, "copy"),
+        "near_copy_rate": mean(mains, "near_copy"),
+        "input_acc": mean(mains, "input_hit"),
+        "input_chance": mean([{"c": 1 / r["n_inputs"]} for r in mains], "c"),
+        "target_acc": mean(with_targets, "target_hit"),
+        "target_chance": mean([{"c": 1 / r["n_mains"]} for r in with_targets], "c"),
+        "cos_main": mean(mains, "cos_main"),
+        "cos_target": mean(mains, "cos_target"),
+        "cos_target_input": mean(mains, "cos_target_input"),
+        "n_no_main_images": len(none),
+        "near_copy_rate_no_main": mean(none, "near_copy"),
+        "per_main": {
+            key: {"copy_rate": mean(rs, "copy"), "cos_main": mean(rs, "cos_main"), "cos_target": mean(rs, "cos_target")}
+            for key, rs in _group(mains, lambda r: f"{r['folder']}__main{r['main']}").items()},
+    }
+
+
+def _group(records, key):
+    out = defaultdict(list)
+    for r in records:
+        out[key(r)].append(r)
+    return out
+
+
+def copy_overview(entries, records, out_dir, tile=200):
+    """Per folder: inputs; then per seed: no main, each designated main (red caption = copy)."""
+    try:
+        font = ImageFont.load_default(size=12)
+    except TypeError:  # older Pillow
+        font = ImageFont.load_default()
+    rec_by_image = {r["image"]: r for r in records}
+    gap, cap = 6, 30
+    rows = []
+    for folder, es in _group(entries, lambda e: e["folder"]).items():
+        inputs = es[0]["inputs"]
+        rows.append([(Image.open(p).convert("RGB"), f"{Path(folder).name[:24]} input_{i}", None)
+                     for i, p in enumerate(inputs)])
+        for seed, ses in _group(es, lambda e: e["seed"]).items():
+            row = []
+            for e in ses:
+                r = rec_by_image[e["path"].name]
+                if e["kind"] == "none":
+                    text = f"no main, seed {seed}\nbest input_{r['best_input']} {r['cos_best_input']:.2f}"
+                    bad = r["near_copy"]
+                else:
+                    text = (f"main {r['main']}, seed {seed}\nin {r['cos_main']:.2f} tgt {r['cos_target']:.2f}"
+                            + (" COPY" if r["copy"] else ""))
+                    bad = r["copy"]
+                row.append((Image.open(e["path"]).convert("RGB"), text, bad))
+            rows.append(row)
+    n_cols = max(len(r) for r in rows)
+    canvas = Image.new("RGB", (gap + n_cols * (tile + gap), gap + len(rows) * (tile + cap + gap)), "white")
+    draw = ImageDraw.Draw(canvas)
+    for ri, row in enumerate(rows):
+        y = gap + ri * (tile + cap + gap)
+        for ci, (img, text, bad) in enumerate(row):
+            x = gap + ci * (tile + gap)
+            canvas.paste(img.resize((tile, tile)), (x, y))
+            draw.multiline_text((x + 2, y + tile + 2), text, fill=(200, 0, 0) if bad else "black", font=font)
+    path = out_dir / "copy_overview.jpeg"
+    canvas.save(path, quality=90)
+    return path
 
 
 # --------------------------------------------------------------------------------------
@@ -372,15 +577,52 @@ def main():
     summary["verdict"] = verdict(summary)
     print(f"verdict (heuristic, highest sigma): {summary['verdict']}")
 
-    images = []
-    if args.image_folders > 0:
-        folders = list(dict.fromkeys(r["folder"] for r in picked))[: args.image_folders]
+    images, copy_entries = [], []
+    if args.image_folders > 0 or args.copy_seeds > 0:
         vae = AutoencoderKL.from_pretrained(run.base_model, subfolder="vae", torch_dtype=DTYPE).to(DEVICE)
         pipe = MultiRefKontextPipeline(
             scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(run.base_model, subfolder="scheduler"),
             vae=vae, text_encoder=None, tokenizer=None, text_encoder_2=None, tokenizer_2=None, transformer=transformer)
         pipe.set_progress_bar_config(disable=True)
-        images = rotation_images(pipe, role, by_folder, folders, store, run, args, out_dir)
+        generate = make_generator(pipe, role, store, run, args)
+        if args.copy_seeds > 0:
+            print(f"\ncopy rate: generating {len(picked)} designated sample(s) x {args.copy_seeds} seed(s) "
+                  f"+ no-main images")
+            copy_entries = generate_copy_images(generate, picked, run, args, out_dir)
+        if args.image_folders > 0:
+            folders = list(dict.fromkeys(r["folder"] for r in picked))[: args.image_folders]
+            images = rotation_images(generate, by_folder, folders, run, args, out_dir)
+        # free the GPU for the image encoder
+        del generate, pipe, vae
+    del transformer, role
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    if copy_entries:
+        clip = ClipImageFeatures()
+        copy_records = score_copy(copy_entries, by_folder, clip, args)
+        with open(out_dir / "copy.csv", "w", newline="") as f:
+            fields = list(dict.fromkeys(k for r in copy_records for k in r))
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(copy_records)
+        copy_summary = summarize_copy(copy_records)
+        copy_summary["overview"] = str(copy_overview(copy_entries, copy_records, out_dir))
+        copy_summary["copy_max"] = args.copy_max
+        summary["copy"] = copy_summary
+        fmt = lambda v: "-" if v is None else f"{v:.2f}"
+        c = copy_summary
+        print(f"\ncopy rate ({c['n_designated_images']} designated images, {c['n_no_main_images']} without a main):")
+        print(f"  copy (closer to the main input than to its target) {fmt(c['copy_rate'])}, "
+              f"near copy (cos_main >= {args.copy_max:g}) {fmt(c['near_copy_rate'])}")
+        print(f"  input_acc {fmt(c['input_acc'])} (chance {fmt(c['input_chance'])}), "
+              f"target_acc {fmt(c['target_acc'])} (chance {fmt(c['target_chance'])})")
+        print(f"  mean cos(output, main input) {fmt(c['cos_main'])}, cos(output, target) {fmt(c['cos_target'])}, "
+              f"cos(target, main input) {fmt(c['cos_target_input'])}")
+        print(f"  no main: near copy of one input {fmt(c['near_copy_rate_no_main'])}")
+        for key, m in c["per_main"].items():
+            print(f"    {key}: copy {fmt(m['copy_rate'])}, cos_main {fmt(m['cos_main'])}, cos_target {fmt(m['cos_target'])}")
+        print(f"  overview: {copy_summary['overview']}")
 
     summary.update({
         "checkpoint": str(args.checkpoint), "base_only": args.base_only, "role": run.role, "layout": run.layout,
