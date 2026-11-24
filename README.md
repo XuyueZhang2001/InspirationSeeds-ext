@@ -4,13 +4,14 @@ This repository builds on [Inspiration Seeds](https://arxiv.org/abs/2602.08615) 
 
 The long-term goal of this fork is to support **N input images with an optional designated main subject** (earlier plan: controllable per-image weight levels). The repository now covers data generation and a first fine-tuning pipeline:
 
-1. decomposing a source image into **N semantically distinct reference images** (N = 2–4, chosen per image, 768 px): **`decompose_v7_2.py`** (adaptive SAE feature grouping + an image-space subject subspace);
-2. synthesizing **designated-subject target images** (1024 px): **`synthesize_v2_1.py`**: for every input designated as the main subject, a target pulled toward that input, so that the same input set gives different targets for different designations;
-3. selecting the targets by hand, with automatic suggestions: **`select_targets.py`**;
-4. building the training data: **`build_dataset.py`** and **`cache_features.py`**;
-5. fine-tuning FLUX.1 Kontext dev (new LoRA; the main image is marked by its position id) on 2–4 reference images with an optional main image: **`train_multiref.py`**; evaluation with **`eval_multiref.py`**, inference with **`generate_multi.py`**.
+1. decomposing a source image into **N semantically distinct reference images** (N = 2–4, chosen per image, 768 px): **`decompose_v7_2.py`** (adaptive SAE feature grouping + an image-space subject subspace), run over a grid of settings by **`run_sweep.sh`**;
+2. scoring the decompositions of the sweep and picking, per source image, one folder for the no-main pool and one for the main pool: **`score_sweep.py`** (CLIP / DINOv2 checks + a VLM; replaces the hand-picking and `screen_sources.py`);
+3. synthesizing **designated-subject target images** (1024 px): **`synthesize_v2_1.py`**: for every input designated as the main subject, a target pulled toward that input, so that the same input set gives different targets for different designations;
+4. selecting the targets by hand, with automatic suggestions: **`select_targets.py`**;
+5. building the training data: **`build_dataset.py`** and **`cache_features.py`**;
+6. fine-tuning FLUX.1 Kontext dev (new LoRA; the main image is marked by its position id) on 2–4 reference images with an optional main image: **`train_multiref.py`**; evaluation with **`eval_multiref.py`**, inference with **`generate_multi.py`**.
 
-Last README update: 2026-11-22.
+Last README update: 2026-11-23 (sweep and automatic scoring: `run_sweep.sh`, `score_sweep.py`).
 
 ---
 
@@ -23,7 +24,9 @@ Last README update: 2026-11-22.
 | **`decompose_v7_2.py`** | **Recommended** decomposition: adaptive grouping of SAE features, coverage expansion, merging, shared-part weakening, subject kept in one input (see below) |
 | `decompose_groups.py`, `decompose_v4.py` … `decompose_v7_1.py` | Earlier versions of the adaptive decomposition, kept for comparison (history below) |
 | `decompose.py` | Earlier fixed-K baseline (k-means into K = 2, 3, 4 clusters); no longer documented |
-| **`screen_sources.py`** | Automatic first pass over `data/no_main/`: folders with at least two distinct, source-related subjects are copied to `generate_source/screening/` for the manual choice of synthesis sources (table and contact sheets in `generate_source/screening/_report/`) |
+| **`run_sweep.sh`** | Runs `decompose_v7_2.py` (unchanged) once per setting of a `--top-k` × `--clean-frac` × `--seed` grid, then `score_sweep.py` (see *Sweep and automatic scoring*) |
+| **`score_sweep.py`** | Scores every folder of a sweep (CLIP / DINOv2 checks, Qwen3-VL main-subject probabilities), picks per source image the best no-main folder (level 1) and the best main folder (level 2), writes a review (`_review/`) and optionally exports the picks to `data/no_main/` and `generate_source/` |
+| `screen_sources.py` | Superseded by `score_sweep.py` (level 2). Earlier first pass over `data/no_main/`: folders with at least two distinct, source-related subjects were copied to `generate_source/screening/` for the manual choice of synthesis sources |
 | **`synthesize_v2_1.py`** | **Recommended** designated-subject target synthesis for `decompose_v7_2.py` outputs: closeness-dependent 2 × 2 grid of interpolation weight × img2img strength (see below) |
 | `synthesize_v2.py` | Previous version: the same synthesis with a full 3 × 3 grid for every main |
 | `synthesize_target.py` | Earlier level-based weighted target synthesis for `decompose.py` outputs |
@@ -50,11 +53,18 @@ All scripts are run from the repository root; the defaults of every script follo
 
 ```
 samples/sources/              source images (fetch_samples.py)
-output/decompose/<run>/       raw decompose_v7_2.py runs, one per setting (nothing else goes to output/)
-data/no_main/                 hand-picked decomposition folders of all runs: the unspecified pool
-generate_source/screening/    screen_sources.py candidates, waiting for the manual review
-    _report/                  screen.csv, contact sheets, summary.json
-generate_source/              reviewed synthesis sources (moved here from screening/)
+output/decompose/sweep/       run_sweep.sh: raw decompose_v7_2.py runs, one subfolder per setting
+    topk<K>_c<clean>_s<seed>/<decompose_v7_2.py folders>   + measure.json, main_choice.json, score.json
+    _sources/                 score_sweep.py: VLM concept inventory per source image, same-kind cache
+    _review/                  score_sweep.py: per-image sheets, overview pages, folders.csv, inputs.csv, summary.json
+    _logs/                    one decompose_v7_2.py log per setting
+    overrides.csv             (optional, by hand) replaces automatic picks of single images
+output/decompose/<run>/       other raw decompose_v7_2.py runs (nothing else goes to output/)
+data/no_main/                 unspecified pool: no-main AND main picks of score_sweep.py (--export-no-main),
+                              plus folders copied by hand earlier
+generate_source/              synthesis sources: main picks of score_sweep.py (--export-main),
+                              plus folders chosen by hand earlier
+    _exported.json            (in both targets) folders written by score_sweep.py; others are never touched
 data/synth/                   synthesize_v2_1.py targets
 data/selection/review/        select_targets.py review folders (manual keep / drop): the designated pool
 data/multiref/                build_dataset.py manifests + cache_features.py cache
@@ -64,18 +74,16 @@ runs/                         training runs
 ```bash
 SRC=samples/sources
 
-# 1. decomposition (768 px inputs), one output folder per setting; the good folders of all
-#    settings are copied by hand to data/no_main/
-python decompose_v7_2.py --image-dir $SRC --output-dir output/decompose/base_s1
-python decompose_v7_2.py --image-dir $SRC --output-dir output/decompose/c05 --clean-frac 0.5
+# 1. decomposition sweep (768 px inputs): decompose_v7_2.py for every top-k x clean-frac x seed
+#    setting, then score_sweep.py (review in output/decompose/sweep/_review/, nothing exported yet)
+./run_sweep.sh $SRC                         # default grid: TOPK="32 64" CLEAN="0.3 0.5 0.7" SEEDS="0 1"
 
-# 2. synthesis sources: automatic screening of data/no_main/ -> generate_source/screening/,
-#    then move the good folders to generate_source/ by hand (delete the others); prefer folders
-#    whose inputs show different subjects (see Target selection, Selection criteria)
-python screen_sources.py --dry-run          # report only, to check the thresholds
-python screen_sources.py
+# 2. check the picks (_review/overview_*.jpeg, <stem>.jpeg), correct single images in
+#    output/decompose/sweep/overrides.csv if needed, rescore (seconds, everything is cached) and export:
+#    no-main + main picks -> data/no_main/ (unspecified pool), main picks -> generate_source/
+python score_sweep.py --export-no-main data/no_main --export-main generate_source
 
-# 3. designated-subject targets (1024 px) for generate_source/ (screening/ is skipped)
+# 3. designated-subject targets (1024 px) for generate_source/
 python synthesize_v2_1.py                   # generate_source -> data/synth
 
 # 4. suggestions + manual selection in data/selection/review/<folder>/main<k>/keep|drop
@@ -215,7 +223,11 @@ Existing output folders are skipped unless `--overwrite` is given, so use a new 
 
 ### Data-generation runs
 
-The decompositions are used to build fine-tuning data, so every source folder is decomposed with **several settings**, and the good input sets are selected afterwards. All runs start from the defaults (`--alpha-r 0.7 --clean-frac 0.3`, no debug images) and change one thing at a time. The per-image folder name is `{stem}_topk{K}_s{seed}_c{clean-frac}_a{alpha-r}_obj{alpha-obj}` (default: `{stem}_topk64_s1_c0.3_a0.7_obj0.5`), so runs that differ in these parameters get different folder names. `--n-max` and `--subject-restore` are **not** in the name, so the `restore` and `n2` runs would overwrite or skip the `base_s1` folders if they shared an output directory. Each run therefore still gets its own `--output-dir`, which also keeps the runs easy to compare.
+The decompositions are used to build fine-tuning data, so every source image is decomposed with **several settings**, and one input set per pool is selected afterwards. The standard way is now the sweep of `run_sweep.sh` (a `--top-k` × `--clean-frac` × `--seed` grid) with the automatic selection of `score_sweep.py`; see *Sweep and automatic scoring* below.
+
+The per-image folder name is `{stem}_topk{K}_s{seed}_c{clean-frac}_a{alpha-r}_obj{alpha-obj}` (default: `{stem}_topk64_s1_c0.3_a0.7_obj0.5`), so runs that differ in these parameters get different folder names. `--n-max` and `--subject-restore` are **not** in the name, so the `restore` and `n2` runs below would overwrite or skip the `base_s1` folders if they shared an output directory. Each run therefore still gets its own `--output-dir` (with `run_sweep.sh`: its own `OUT=`), which also keeps the runs easy to compare.
+
+The single-setting runs below were the earlier hand-run settings. They change one thing at a time from the defaults (`--alpha-r 0.7 --clean-frac 0.3`, no debug images) and are still useful for parameters the sweep does not vary (`--alpha-r`, `--alpha-obj`, `--subject-restore`, `--n-max`), e.g. `OUT=output/decompose/sweep_a10 DECOMPOSE_ARGS="--alpha-r 1.0" ./run_sweep.sh samples/sources`.
 
 | Run | Arguments (added to the defaults) | What changes | When it gives better pairs |
 |---|---|---|---|
@@ -244,7 +256,7 @@ python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/obj03   --alpha-obj 
 python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/n2      --n-max 2
 ```
 
-Resulting layout: `output/decompose/<run>/<stem>_topk64_s{seed}_c{c}_a{a}_obj{obj}/` (e.g. `output/decompose/c05/14_topk64_s1_c0.5_a0.7_obj0.5/`) with `input_*.jpeg`, `overview.jpeg`, `embeds.pt`, `groups.json`, plus `output/decompose/<run>/summary.json`. For one source image there are therefore up to 9 candidate input sets; comparing the `overview.jpeg` of the same `<stem>` across runs is the quickest visual check. The good folders of all runs are copied (flat, the folder names differ between settings) to `data/no_main/`, the unspecified pool of `build_dataset.py`; several settings of one source may be kept. The `restore` and `n2` runs have the same folder names as `base_s1`, so only one of these three versions of a source can be kept in `data/no_main/`.
+Resulting layout: `output/decompose/<run>/<stem>_topk64_s{seed}_c{c}_a{a}_obj{obj}/` (e.g. `output/decompose/c05/14_topk64_s1_c0.5_a0.7_obj0.5/`) with `input_*.jpeg`, `overview.jpeg`, `embeds.pt`, `groups.json`, plus `output/decompose/<run>/summary.json`. For one source image there are therefore up to 9 candidate input sets; comparing the `overview.jpeg` of the same `<stem>` across runs is the quickest visual check. Earlier, the good folders of all runs were copied by hand (flat, the folder names differ between settings) to `data/no_main/`, the unspecified pool of `build_dataset.py`; folders copied this way stay there and are never touched by the export of `score_sweep.py`. The `restore` and `n2` runs have the same folder names as `base_s1`, so only one of these three versions of a source can be kept in `data/no_main/`.
 
 Notes:
 - The subject subspaces are cached in `text_cache/` and shared by all runs (the prior settings are the same), so only the first run pays for them.
@@ -263,7 +275,7 @@ Fields that help with selection (`summary.json` per image, details in `groups.js
 | `subject`, `subject.margin_top1_top2` | Small margin = uncertain subject; check visually |
 | `subject.subject_strength_inputs_after[*].proj_ratio` vs. `subject_strength_source.proj_ratio` | The keeper should be close to the source value, the others clearly lower |
 
-No thresholds are fixed yet; they should be set after looking at a first batch.
+These fields are not used by `score_sweep.py` (it only reads `image`, `decomposable`, `top_k`, `clean_frac` and `seed` from `groups.json`); they remain useful for looking into single folders.
 
 ### Parameters
 
@@ -376,6 +388,140 @@ One folder per image: `<output-dir>/{image stem}_topk{top-k}_s{seed}_c{clean-fra
 
 ---
 
+## Sweep and automatic scoring (`run_sweep.sh`, `score_sweep.py`)
+
+### Goal
+
+Every source image is decomposed with several settings, and the right setting depends on the image. Instead of comparing the folders by eye and copying the good ones by hand, `score_sweep.py` checks what the inputs of every folder actually show and picks, **per source image**:
+
+- a **no-main pick** (level 1): all inputs are different, come from the source and each clearly shows its own concept. Used as an unspecified sample (target = the source image).
+- a **main pick** (level 2): a level-1 folder in which at least two inputs each show a different, prominent object. Used as a synthesis source for designated-subject targets (replaces `screen_sources.py` and the manual move to `generate_source/`).
+
+`decompose_v7_2.py` is not changed. The picks of one image never depend on other images.
+
+### Sweep (`run_sweep.sh`)
+
+```bash
+./run_sweep.sh samples/sources/14.jpeg      # one image
+./run_sweep.sh samples/sources              # every image in the folder
+TOPK=64 CLEAN="0.3 0.7" SEEDS=1 ./run_sweep.sh samples/sources/14.jpeg   # quick test
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OUT` | `output/decompose/sweep` | Sweep root |
+| `TOPK` | `"32 64"` | `--top-k` values |
+| `CLEAN` | `"0.3 0.5 0.7"` | `--clean-frac` values |
+| `SEEDS` | `"0 1"` | `--seed` values |
+| `DECOMPOSE_ARGS` | – | Further `decompose_v7_2.py` options for every run, e.g. `"--steps 25"` |
+
+The defaults give 2 × 3 × 2 = 12 folders per source image in `$OUT/topk<K>_c<clean>_s<seed>/`, logs in `$OUT/_logs/`. Existing folders are skipped by `decompose_v7_2.py`, so an interrupted sweep continues where it stopped. At the end `score_sweep.py` runs on the images of the sweep **without export**.
+
+`--seed` only changes the Kandinsky decoding: the SAE grouping (`groups.json`) depends on `--top-k` and `--clean-frac` only, so the seed axis gives another rendering of the same decomposition (the default grid has 6 different groupings per image).
+
+### Checks
+
+**Cheap checks (every folder)**, with the CLIP image encoder of the Kandinsky 2.2 prior and DINOv2 (`measure.json`):
+
+| Label | Condition |
+|---|---|
+| `unrelated` | `rel_clip` = cos(input, source) < `--min-rel` |
+| `source_copy` | `rel_clip` > `--max-rel` |
+| `duplicate` | two inputs look the same: `pair_clip` ≥ `--dup-clip` or `pair_dino` ≥ `--dup-dino`; the input less related to the source is marked |
+
+**VLM checks** (Qwen3-VL-8B-Instruct, only on folders that pass the cheap checks):
+
+1. **Source inventory** (once per source image, `_sources/<stem>.json`): the VLM lists at most `--max-concepts` visible concepts of the source, each ONE thing (`boy` and `kite`, never `boy flying a kite`), with a type (`object`, `material`, `color`, `shape`, `pattern`, `style`, `scene`). The SAE groups have no names, so this inventory is the vocabulary of the checks.
+2. **Main-choice table** (per folder, `main_choice.json`): one multiple-choice question per input, *"Which ONE of these is the main subject of this image? 0 = none of these, 1 = boy, 2 = kite, …"*. The probabilities of the answer digits are read from one forward pass (no text is generated), so every input gets a distribution over the concepts. A yes/no question ("is X shown?") is answered yes for anything visible and saturates. The digits limit the inventory to 9 concepts.
+
+The **own concept** of an input is the most likely answer, `own_p` its probability. Further labels:
+
+| Label | Condition |
+|---|---|
+| `not_in_source` | "none of these" is the most likely answer (broken image or content not in the source) |
+| `unclear` | `own_p` < `--min-own` |
+| `shared_concept` | two inputs have the same own concept (the one with the lower `own_p` is marked), or the own concept of another input is an **object** and gets a main-subject probability ≥ `--leak` in this input (it competes as the subject). Scenes, colors, styles etc. are not checked for leaks: a meadow behind every input is fine |
+
+An input gets the first matching label (order of the two tables), otherwise `unique`.
+
+- **Level 1**: `no_main_ok` = decomposable, ≥ 2 inputs, all inputs `unique`.
+- **Level 2**: `main_ok` = `no_main_ok` and `n_objects` ≥ `--min-objects`, where `n_objects` is the number of different kinds among the unique inputs whose own concept is an `object` with `own_p` ≥ `--prominent`. Two objects are the same kind if the VLM (text only) answers *"Are a and b the same kind of object?"* with P(yes) ≥ 0.5 (bird / parrot → same; cached in `_sources/same_kind.json`).
+
+### Score and picks
+
+$$\text{score} = \sum_{\text{unique inputs}} \text{own\_p} \;+\; \bigl(1 - \text{mean pair\_clip between inputs}\bigr)$$
+
+- **No-main pick**: best-scoring `no_main_ok` folder of the image; **main pick**: best-scoring `main_ok` folder. They can be the same folder.
+- **Cascade**: before the VLM, `own_p` is counted as 1, so this *cheap score* is an upper bound of the final score. The VLM checks the folders that pass the cheap checks from the best cheap score down and skips a folder once its cheap score cannot beat the picks already found; at most `--vlm-top` folders per image (0 = no limit). Skipped folders are marked `not checked` and cannot be picked.
+- **Overrides**: `<sweep-root>/overrides.csv` with columns `stem,no_main,main` replaces the automatic picks of an image. A value is a folder name as in `folders.csv` `name` (e.g. `topk64_c0.3_s0/14_topk64_s0_c0.3_a0.7_obj0.5`), `none` for no pick, empty for automatic. Rerun the scorer to apply it.
+- With `--no-vlm` only the cheap checks run: `no_main_ok` then means "passes the cheap checks", and there are no main picks.
+
+### Usage
+
+```bash
+python score_sweep.py                                   # all folders under output/decompose/sweep
+python score_sweep.py --image samples/sources/14.jpeg   # only the folders of one source image
+python score_sweep.py --image-dir samples/sources       # the folders of the images in a folder
+python score_sweep.py --leak 0.7 --min-objects 3        # other thresholds (cached, takes seconds)
+python score_sweep.py --export-no-main data/no_main --export-main generate_source
+```
+
+Every measurement and VLM answer is cached (`measure.json`, `main_choice.json`, `_sources/`); changing a threshold and rerunning takes seconds (the VLM may be asked about a few more folders if the picks change). `--remeasure` recomputes the CLIP / DINOv2 measurements, `--reask` asks the VLM again. Cached VLM answers are also asked again when `--vlm-model` or the prompts (`PROMPT_VERSION` in the script) change.
+
+### Parameters
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `--sweep-root` | `output/decompose/sweep` | Every folder with a `groups.json` below it is scored (except `_review/`, `_logs/`, `_sources/`); source image and settings are read from `groups.json`, never from folder names |
+| `--image` / `--image-dir` | all | Only the folders of these source images (by stem) |
+| `--export-no-main` | – | Sync no-main **and** main picks to this folder (`data/no_main`) |
+| `--export-main` | – | Sync main picks to this folder (`generate_source`) |
+| `--no-vlm` | off | Cheap checks only |
+| `--vlm-top` | 4 | VLM-check at most this many folders per image (0 = all) |
+| `--vlm-model` | `Qwen/Qwen3-VL-8B-Instruct` | VLM |
+| `--vlm-size` | 448 | Images are resized to this size for the VLM |
+| `--max-concepts` | 8 | Concepts in a source inventory (≤ 9) |
+| `--dino-model` | `facebook/dinov2-base` | DINOv2 model of the duplicate check |
+| `--min-rel` | 0.4 | `unrelated` if `rel_clip` < this |
+| `--max-rel` | 0.92 | `source_copy` if `rel_clip` > this |
+| `--dup-clip` | 0.8 | duplicate pair if `pair_clip` ≥ this |
+| `--dup-dino` | 0.75 | duplicate pair if `pair_dino` ≥ this |
+| `--min-own` | 0.4 | `unclear` if `own_p` < this |
+| `--leak` | 0.3 | `shared_concept` if another input's own object gets a main-subject probability ≥ this |
+| `--prominent` | 0.5 | an object counts for level 2 if its `own_p` ≥ this |
+| `--min-objects` | 2 | `main_ok` needs this many different prominent objects |
+| `--overview-rows` | 20 | Rows per overview page |
+| `--remeasure`, `--reask` | off | Ignore the cached measurements / VLM answers |
+
+### Output
+
+| Path | Content |
+|---|---|
+| `<folder>/measure.json` | `rel_clip`, `rel_dino`, `pair_clip`, `pair_dino` |
+| `<folder>/main_choice.json` | Concept names and the main-choice probabilities of every input |
+| `<folder>/score.json` | Labels, own concepts, flags (`no_main_ok`, `main_ok`, `n_objects`), score, picks and reason of the last scoring |
+| `_sources/<stem>.json` | Source inventory (raw VLM answers included) |
+| `_review/<stem>.jpeg` | Every folder of one source image, picks first: verdict, score, reason, then source, `recon.jpeg` and the inputs with own concept, `own_p`, label, type, "none" probability, `rel_clip` / `rel_dino`. Redrawn for the images scored in a run |
+| `_review/overview_XX.jpeg` | One row per pick of every image (an image without a pick: its best folder, in red): the whole dataset at a glance |
+| `_review/folders.csv`, `inputs.csv` | One line per folder / per input of every scored folder |
+| `_review/summary.json` | Counts per number of inputs and per setting, label rates, images without a no-main / main pick, picked object names, thresholds of the last run |
+
+The review covers every folder that has a `score.json` of the current script version, so scoring one image or a batch adds to it. `score.json` files of an older version are left out (the script prints which images to rescore).
+
+### Export
+
+`--export-no-main` and `--export-main` **sync** the target folder with the picks of the images scored in this run:
+
+- new picks are copied unchanged, under their own folder name, and listed in `<target>/_exported.json`;
+- a folder this script exported earlier for one of these images that is **no longer a pick** is **deleted**;
+- folders not listed in `_exported.json` (e.g. copied by hand earlier) are never touched.
+
+Main picks also go to `data/no_main/`, so that `build_dataset.py` finds byte-identical inputs for the designated samples synthesized on `generate_source/`.
+
+> **Freeze the picks before synthesis.** The review folders of `select_targets.py` refer to the inputs in `generate_source/<folder>/`. If a later rescoring (other thresholds, more seeds) changes a main pick and is exported, the old folder is deleted from `generate_source/` and `data/no_main/`, and the designated samples synthesized on it lose their inputs. Once `synthesize_v2_1.py` has run on a pick, keep it with `overrides.csv`, or export to new folders.
+
+---
+
 ## Designated-subject target synthesis (`synthesize_v2_1.py`)
 
 ### Goal
@@ -453,7 +599,7 @@ Folders that already contain `synth_meta.json` are skipped unless `--overwrite` 
 | Argument | Default | Description |
 |---|---|---|
 | `--root` | `generate_source` | Directory with decomposition folders (searched recursively for `embeds.pt` + `input_0.jpeg`), or one such folder |
-| `--exclude` | `screening` | Comma-separated directory names under `--root` that are skipped (the unreviewed `screen_sources.py` candidates) |
+| `--exclude` | `screening` | Comma-separated directory names under `--root` that are skipped (the unreviewed candidates of the earlier `screen_sources.py`; not used by `score_sweep.py`) |
 | `--output-dir` | `data/synth` | Output root; the folder structure under `--root` is kept |
 | `--close-threshold` | 0.6 | An input is close if $\cos(f(\text{input}), f(\text{recon})) \ge$ this value; 0 = every input close, > 1 = every input far |
 | `--close-t` | `0,0.3` | Interpolation weights $t$ for close mains |
@@ -570,7 +716,7 @@ A change of the subject is fine as long as ① and ② hold: a bird with the sta
 
 Why it matters: an ambiguous target is a noisy label that the model cannot resolve. In the overfitting tests (*Current findings*), the main whose kept target failed ① and ② (statue → real birds, with a second bird input in the folder) was the only one never learned: the model either copied the statue (the base model's default for that input) or produced the target of the other bird input; the three mains with clear targets were learned.
 
-Automatic hints: `margin` (criterion ②, cosine to the main minus the largest cosine to another input) and `cos_main` (criterion ③) of `suggestions.csv`. The default `--margin-min` (−0.15) is lenient and global CLIP features capture the category more than the identity, so criterion ① can only be checked by eye; look at folders with two inputs of the same category first. When choosing synthesis sources (`screen_sources.py`, step 2 of the pipeline), prefer folders whose inputs show different subjects: two inputs of one category make their targets ambiguous from the start.
+Automatic hints: `margin` (criterion ②, cosine to the main minus the largest cosine to another input) and `cos_main` (criterion ③) of `suggestions.csv`. The default `--margin-min` (−0.15) is lenient and global CLIP features capture the category more than the identity, so criterion ① can only be checked by eye; look at folders with two inputs of the same category first. Synthesis sources should have inputs that show different subjects: two inputs of one category make their targets ambiguous from the start. `score_sweep.py` checks this for the main picks (level 2: at least `--min-objects` prominent objects of different kinds, same-kind test by the VLM); when overriding a main pick by hand (`overrides.csv`, step 2 of the pipeline), follow the same rule.
 
 ### Usage and parameters
 
@@ -597,7 +743,7 @@ python select_targets.py --synth-root data/synth --output-dir data/selection
 | unspecified | `input_*.jpeg` of a decomposition folder | none | the original source image (path from `groups.json` → `image`, else `<stem>.*` in `--source-dir`) | every folder of `--decomp-root` (`data/no_main`), one sample each; `recon.jpeg` is not used |
 | designated | the same inputs | input $k$ | the files in `review/<folder>/main<k>/keep/`, one picked at random per draw | the review folders of `select_targets.py` |
 
-- **Input consistency.** The designated targets were synthesized on `generate_source/`, a hand-picked copy of part of `data/no_main` (`screen_sources.py` + manual review). For every review folder the inputs are compared byte by byte with the folder of the same name in `--decomp-root`; if identical, the `data/no_main` paths are used (both pools share the cached latents), otherwise the inputs of the synthesis are kept and the folder is reported, because a target must come with the inputs it was synthesized from.
+- **Input consistency.** The designated targets were synthesized on `generate_source/`, a copy of part of `data/no_main` (main picks of `score_sweep.py`, which are exported to both folders; earlier: `screen_sources.py` + manual review). For every review folder the inputs are compared byte by byte with the folder of the same name in `--decomp-root`; if identical, the `data/no_main` paths are used (both pools share the cached latents), otherwise the inputs of the synthesis are kept and the folder is reported, because a target must come with the inputs it was synthesized from.
 - **Split by source image**, stratified: `--val-frac` (10 %) of the sources that have designated samples and 10 % of the others go to validation, so validation contains both pools.
 - **No ratio in the manifests.** The share of the two pools is decided during training by the pool schedule (see below); the manifests only record the pool of every sample, and the input order is shuffled at training time.
 
@@ -981,6 +1127,14 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 3. **SAE bias.** Weak groups decode to unrelated animals.
 4. **Retrieval vocabulary.** Subjects outside the built-in list are matched to the nearest listed noun; use `--subject-map` or `--noun-vocab`.
 
+### Sweep scoring (`score_sweep.py`)
+
+1. **Uncalibrated thresholds.** The defaults have not yet been compared with hand labels on a larger batch. The docstring mentions a `check_scoring.py` for this comparison, but it is not in the repository yet.
+2. **The score favours more inputs.** Every unique input adds its `own_p` (≥ `--min-own`), so a clear 4-input folder usually beats a clean 2-input folder, and the picks may lean toward 3–4 inputs. Check `summary.json` → `by_n_inputs`.
+3. **`--vlm-top 4` of 12 folders.** Folders below the first four candidates of an image are not checked and cannot be picked; if all four fail, the image has no pick although a later folder might pass. Check `images_without_no_main_pick` / `images_without_main_pick` and raise `--vlm-top` if needed.
+4. **Two unspecified samples per source.** If the no-main pick and the main pick of an image differ, both go to `data/no_main/` with the same target (the source image), so that source counts twice in the unspecified pool. Folders copied by hand earlier add to this.
+5. **Export deletes folders** that are no longer picks (see *Export*), including synthesis sources that already have designated targets.
+
 ### Designated-subject synthesis (`synthesize_v2_1.py`)
 
 1. **Provisional grids and threshold.** The close / far threshold and both 2 × 2 grids come from 7 hand-picked cells on 14 folders.
@@ -1016,7 +1170,8 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 2. **Bias-dominated groups**: detect inputs with a high `cos_to_bias` / weak own group and drop or merge them.
 3. **Several subjects**: handle the top nouns with a sufficient margin, each kept in one input.
 4. **Seed stability** as a filter: decode with 2–3 seeds and keep inputs whose content is stable.
-5. **Calibrate the suggestions of `select_targets.py`** against the manual selection (cells moved between `keep/` and `drop/`) on 1024 px targets, and add a structural metric such as DINO to tell shape-preserving cells apart.
+5. **Calibrate `score_sweep.py`** against hand labels (no-main / main / reject per folder) on a first batch of the sweep, and decide whether the score should be normalized by the number of inputs.
+6. **Calibrate the suggestions of `select_targets.py`** against the manual selection (cells moved between `keep/` and `drop/`) on 1024 px targets, and add a structural metric such as DINO to tell shape-preserving cells apart.
 
 ### Fixed-K baseline (earlier plan)
 
