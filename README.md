@@ -133,8 +133,8 @@ The scripts carry PEP 723 headers for `uv run`, but on our server `uv run` insta
 uv venv seeds-env --python 3.12          # or: python3 -m venv seeds-env
 source seeds-env/bin/activate
 
-# PyTorch built for the driver's CUDA version (check "CUDA Version" in nvidia-smi)
-uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+# PyTorch + torchvision built for the driver's CUDA version (check "CUDA Version" in nvidia-smi)
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
 # decomposition
 uv pip install numpy diffusers scikit-learn tqdm transformers huggingface-hub
@@ -142,14 +142,24 @@ uv pip install numpy diffusers scikit-learn tqdm transformers huggingface-hub
 uv pip install datasets pillow
 # generation (generate.py)
 uv pip install "diffusers @ git+https://github.com/huggingface/diffusers.git" peft accelerate protobuf sentencepiece
+# scoring (score_sweep.py, score_synth.py): Qwen3-VL and DINOv2 through transformers
+uv pip install -U "transformers>=4.57"
 
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python -c "import torch, torchvision; print(torch.__version__, torchvision.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
 Notes:
 - An environment created with `uv venv` has no `pip`; install packages with `uv pip install`, not `pip install`.
 - Run scripts with `python ...` inside the activated environment, not `uv run ...` (which would build a separate environment from the script header).
-- The warning `CLIPImageProcessor requires torchvision` is harmless. Install `torchvision` from the same CUDA index to silence it.
+- `torchvision` is **required** by `score_sweep.py` and `score_synth.py`: the Qwen3-VL processor fails to load without it (`ImportError: Qwen3VLVideoProcessor requires the Torchvision library`). It must match the installed torch (torch 2.11.0 ↔ torchvision 0.26.0; in general torch 2.x ↔ torchvision 0.(x+15)). To add it to an existing environment without changing torch: `uv pip install "torchvision==0.26.0" --index-url https://download.pytorch.org/whl/cu128`.
+- Qwen3-VL needs `transformers` 4.57 or newer (`python -c "import transformers; print(transformers.__version__)"`).
+- The exact package versions of a working environment are recorded in `requirements-lock.txt` (`uv pip freeze > requirements-lock.txt`; update it after installing new packages). To recreate that environment:
+  ```bash
+  uv venv seeds-env --python 3.12 && source seeds-env/bin/activate
+  uv pip install -r requirements-lock.txt \
+      --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match
+  ```
+  The `+cu128` builds of torch / torchvision only exist on the PyTorch index; `--index-strategy unsafe-best-match` lets uv search both indexes for every package.
 - Fine-tuning (`train_multiref.py`) needs `peft` (installed with the generation packages); `--tensorboard` additionally needs `uv pip install tensorboard`.
 
 ### Hugging Face access

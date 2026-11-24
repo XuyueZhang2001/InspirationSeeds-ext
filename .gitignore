@@ -129,6 +129,7 @@ samples/
 outputs*/
 test_decompose*/
 generate_source/
+generate_source_handpicked/
 
 # Local virtual environment
 seeds-env/
@@ -149,3 +150,6 @@ runs/
 logs/
 *.log
 *.out
+
+# Compares
+cmp/
