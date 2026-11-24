@@ -8,7 +8,7 @@ Grid experiment for "designated main subject" targets. It replaces the level-bas
 reweighting of synthesize_target.py (c_i = w_i / m_i) with a single knob per designated
 input, and anchors the rough shape of the target to that input.
 
-Input: decomposition folders written by decompose_v7_2.py (N = 2-4 inputs per folder):
+Input: decomposition folders written by decompose.py (N = 2-4 inputs per folder):
     <root>/<name>/embeds.pt, groups.json, recon.jpeg, input_0.jpeg, input_1.jpeg, ...
 
 For every folder and every input k that is designated as the main subject:
@@ -64,10 +64,10 @@ Usage
 
 Notes
 -----
-* Models and loading are the same as in decompose.py / decompose_v7_2.py (Kandinsky 2.2
+* Models and loading are the same as in decompose_kmeans.py / decompose.py (Kandinsky 2.2
   prior + decoder); the img2img pipeline reuses the decoder's unet, scheduler and movq, so
   no additional weights are loaded. The SAE is not needed.
-* Use the same --size / --steps as the decomposition run (decompose_v7_2.py: 768 / 50).
+* Use the same --size / --steps as the decomposition run (decompose.py: 768 / 50).
 """
 
 import argparse
@@ -80,7 +80,7 @@ from diffusers.utils import load_image
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
-from decompose import load_kandinsky
+from decompose_kmeans import load_kandinsky
 
 DEVICE = "cuda"
 
@@ -148,7 +148,7 @@ def generate_img2img(img2img, image_embeds, init_image, negative_emb, strength: 
 
 @torch.inference_mode()
 def generate_plain(decoder, image_embeds, negative_emb, seed: int, steps: int, size: int, guidance: float):
-    """Plain decode of an embedding (no init image), as in decompose_v7_2.generate."""
+    """Plain decode of an embedding (no init image), as in decompose.generate."""
     generator = torch.Generator(DEVICE).manual_seed(seed)
     return decoder(
         image_embeds=image_embeds.unsqueeze(0),
@@ -373,7 +373,7 @@ def main():
                    help="Add a reference column decoded from e_T alone (no init image)")
     p.add_argument("--seed", type=int, default=1, help="Kandinsky seed, shared by every cell")
     p.add_argument("--steps", type=int, default=50, help="Kandinsky steps (actual img2img steps = int(steps * strength))")
-    p.add_argument("--size", type=int, default=768, help="Output resolution (decompose_v7_2.py uses 768)")
+    p.add_argument("--size", type=int, default=768, help="Output resolution (decompose.py uses 768)")
     p.add_argument("--guidance-scale", type=float, default=4.0, help="Decoder guidance scale (pipeline default 4.0)")
     p.add_argument("--tile", type=int, default=256, help="Tile size in the overview image")
     p.add_argument("--limit", type=int, default=None, help="Only process the first LIMIT folders")

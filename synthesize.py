@@ -1,6 +1,8 @@
 """
-synthesize_v2_1.py (v2.1) -- designated-subject targets with an automatic 2 x 2 grid per main.
-Last modified: 2026-11-19 (default --output-dir data/synth; --exclude, default "screening": the
+synthesize.py (v2.1) -- designated-subject targets with an automatic 2 x 2 grid per main.
+Last modified: 2026-11-24 (renamed synthesize_v2_1.py -> synthesize.py; decompose_v7_2.py is now
+               decompose.py)
+               2026-11-19 (default --output-dir data/synth; --exclude, default "screening": the
                screen_sources.py candidates in generate_source/screening/ are not synthesized)
                2026-11-18 (default --root hf_generate_source -> generate_source)
                2026-11-17 (default --size 768 -> 1024, the target size of the original Inspiration Seeds)
@@ -42,7 +44,7 @@ runs only a 2 x 2 grid chosen by that class.
 
 Method (unchanged from v2)
 --------------------------
-For one decomposition folder written by decompose_v7_2.py (N = 2-4 inputs) and every input k
+For one decomposition folder written by decompose.py (v7.2; N = 2-4 inputs) and every input k
 that is designated as the main subject:
   1. e_T = (1 - t) * e + t * e_k, rescaled to ||e||
      (e = embeds.pt["e"], e_k = embeds.pt["e_inputs"][k]; t = 0 source, t = 1 input k).
@@ -65,22 +67,22 @@ per designated input, one row per t (first cell = the main input), one column pe
 Usage
 -----
     # default: class-dependent 2 x 2 grid for every input of every folder
-    python synthesize_v2_1.py --root generate_source --output-dir data/synth
+    python synthesize.py --root generate_source --output-dir data/synth
 
     # other threshold / grids
-    python synthesize_v2_1.py --close-threshold 0.65 --far-s 0.4,0.55,0.7
+    python synthesize.py --close-threshold 0.65 --far-s 0.4,0.55,0.7
 
     # treat every input as "far" (threshold above 1) or as "close" (threshold 0)
-    python synthesize_v2_1.py --close-threshold 1.1
-    python synthesize_v2_1.py --close-threshold 0
+    python synthesize.py --close-threshold 1.1
+    python synthesize.py --close-threshold 0
 
 Notes
 -----
-* Models and loading are the same as in decompose.py / decompose_v7_2.py; the img2img
+* Models and loading are the same as in decompose_kmeans.py / decompose.py; the img2img
   pipeline reuses the decoder's unet, scheduler and movq. The SAE is not needed.
 * Resolution: targets are generated at --size (1024 by default, like the real source images
   that serve as targets of unspecified samples). The decomposed inputs are 768 px
-  (decompose_v7_2.py --size 768); they are upsampled to --size only to serve as img2img
+  (decompose.py --size 768); they are upsampled to --size only to serve as img2img
   init images. recon.jpeg is used only through CLIP, so its resolution does not matter.
 """
 
@@ -94,7 +96,7 @@ from diffusers.utils import load_image
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
-from decompose import load_kandinsky
+from decompose_kmeans import load_kandinsky
 
 DEVICE = "cuda"
 
@@ -168,7 +170,7 @@ def generate_img2img(img2img, image_embeds, init_image, negative_emb, strength: 
 
 @torch.inference_mode()
 def generate_plain(decoder, image_embeds, negative_emb, seed: int, steps: int, size: int, guidance: float):
-    """Plain decode of an embedding (no init image), as in decompose_v7_2.generate."""
+    """Plain decode of an embedding (no init image), as in decompose.generate."""
     generator = torch.Generator(DEVICE).manual_seed(seed)
     return decoder(
         image_embeds=image_embeds.unsqueeze(0),

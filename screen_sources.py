@@ -1,27 +1,27 @@
 """
 screen_sources.py -- automatic first pass: which decomposition folders of data/no_main can serve as
-sources of designated-main targets (synthesize_v2_1.py). Candidates are copied to
+sources of designated-main targets (synthesize.py). Candidates are copied to
 generate_source/screening/ for manual review.
 Last modified: 2026-11-19
 
 Data layout
-    output/decompose/<run>/     raw decompose_v7_2.py runs (one per setting)
+    output/decompose/<run>/     raw decompose.py runs (one per setting)
     data/no_main/               hand-picked decompositions of all settings (unspecified pool of
                                 build_dataset.py, and the input of this script)
     generate_source/screening/  candidates of this script + _report/ (table, contact sheets)
     generate_source/            folders you move here from screening/ after review
-                                (synthesize_v2_1.py skips screening/)
-    data/synth/, data/selection/   synthesize_v2_1.py and select_targets.py
+                                (synthesize.py skips screening/)
+    data/synth/, data/selection/   synthesize.py and select_targets.py
 
 A folder is useful for designated targets if at least two of its inputs show clearly DIFFERENT,
 recognizable subjects (e.g. a woman, flowers, a statue), not variants of one object (shape /
 material / color of the same vase) and not content unrelated to the source (hallucinated
 objects). This script scores that with image-level CLIP features of the Kandinsky 2.2 prior
-(the encoder synthesize_v2_1.py uses for its closeness) and copies the candidates.
+(the encoder synthesize.py uses for its closeness) and copies the candidates.
 It is a lenient first pass: you prune by hand afterwards.
 
 Measures per folder (inputs re-encoded from input_k.jpeg; source = groups.json "image")
-    noun_k        top-1 noun of input k (CLIP retrieval over decompose_v7_2.BUILTIN_NOUNS,
+    noun_k        top-1 noun of input k (CLIP retrieval over decompose.BUILTIN_NOUNS,
                   "a photo of a {noun}"), with its similarity
     rel_k         cos(input_k, source): how much input k belongs to the source image.
                   Inputs with rel_k < --min-relevance are flagged "low" (often hallucinated
@@ -43,7 +43,7 @@ Copying (skipped with --dry-run)
 Manual review
     keep:    move <screen-dir>/<folder>/ to generate_source/<folder>/
     reject:  delete <screen-dir>/<folder>/
-    Then run synthesize_v2_1.py on generate_source (screening/ is excluded by default).
+    Then run synthesize.py on generate_source (screening/ is excluded by default).
 
 Report (--report-dir, default <screen-dir>/_report)
     screen.csv                 one line per folder: measures, candidate, reason, copied
@@ -77,7 +77,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from transformers import CLIPImageProcessor, CLIPTextModelWithProjection, CLIPTokenizer, CLIPVisionModelWithProjection
 
-from decompose_v7_2 import BUILTIN_NOUNS, IMAGE_EXTS
+from decompose import BUILTIN_NOUNS, IMAGE_EXTS
 
 PRIOR = "kandinsky-community/kandinsky-2-2-prior"
 RECORD = "_screened.txt"

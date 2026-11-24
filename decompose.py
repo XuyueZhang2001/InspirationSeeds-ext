@@ -1,7 +1,9 @@
 """
-decompose_v7_2.py (v7.2) -- adaptive SAE feature grouping with coverage expansion,
+decompose.py (v7.2) -- adaptive SAE feature grouping with coverage expansion,
 input-based merging and an image-space subject kept in exactly one input.
-Last modified: 2026-11-19 (default --output-dir groups_out -> output/decompose/v72)
+Last modified: 2026-11-24 (renamed decompose_v7_2.py -> decompose.py; the earlier k-means
+               decompose.py is now decompose_kmeans.py, which also holds the shared loaders)
+               2026-11-19 (default --output-dir groups_out -> output/decompose/v72)
                2026-11-18 (usage example: hf_samples/sources -> samples/sources, hf_v72 -> v72)
                2026-11-17 (output folder name <stem>_topk<K>_s<seed>_c<clean-frac>_a<alpha-r>_obj<alpha-obj>,
                was <stem>_topk<K>_nmax<n-max>; help text of --size, default stays 768)
@@ -93,7 +95,7 @@ Version history
 ---------------
 * decompose_original.py : Inspiration Seeds. k-means into 2 clusters on decoded SAE
   features, cleaning near the other cluster, inputs e +/- lambda (d_1 - d_0).
-* decompose.py           : K clusters (k-means), one-vs-rest direction
+* decompose_kmeans.py    : K clusters (k-means), one-vs-rest direction (formerly decompose.py)
   v_i = d_i - mean_{j != i} d_j, inputs e + lambda v_i; saves embeddings and metadata.
 * decompose_groups.py v1 : adaptive grouping with FINCH and the ConceptExpress threshold
   (max intra-cluster distance), conditions e_group = Dec(a^(i)) and
@@ -110,7 +112,8 @@ Version history
 * decompose_v6.py        : weakening of the whole shared part (--alpha-r), merge threshold 0.85.
 * decompose_v7.py        : subject subspace from CLIP text deltas, subject input.
 * decompose_v7_1.py      : image-space subject subspace via the prior.
-* decompose_v7_2.py      : this file (subject kept in one input, no separate subject input).
+* decompose.py (v7.2)    : this file (subject kept in one input, no separate subject input);
+                           formerly decompose_v7_2.py.
 
 Method (per source image)
 -------------------------
@@ -136,8 +139,8 @@ Method (per source image)
  11. Decode every input with Kandinsky 2.2, same seed for every input.
 
 Usage:
-  python decompose_v7_2.py --image path/to/img.jpeg --output-dir output/decompose/test
-  python decompose_v7_2.py --image-dir samples/sources --output-dir output/decompose/base_s1
+  python decompose.py --image path/to/img.jpeg --output-dir output/decompose/test
+  python decompose.py --image-dir samples/sources --output-dir output/decompose/base_s1
   (output/decompose/ keeps the raw runs only; the folders used for training are copied by hand
    to data/no_main/)
 """
@@ -154,7 +157,8 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from tqdm import tqdm
 
-from decompose import embed_image, load_kandinsky, load_sae
+# shared loaders (also re-exported: older scripts import them with "from decompose import ...")
+from decompose_kmeans import embed_image, load_kandinsky, load_sae
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
@@ -1027,7 +1031,7 @@ def main():
     p.add_argument("--beta-amb", type=float, default=1.0, help="How much of the ambiguous features to remove (0..1)")
     # generation
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--steps", type=int, default=50, help="Kandinsky inference steps (decompose.py uses 18)")
+    p.add_argument("--steps", type=int, default=50, help="Kandinsky inference steps (decompose_kmeans.py uses 18)")
     p.add_argument("--size", type=int, default=768,
                    help="Kandinsky output size. 768 gives better decompositions than 512; for multi-reference "
                         "training the inputs are downscaled to --ref-size (512) when they are cached")

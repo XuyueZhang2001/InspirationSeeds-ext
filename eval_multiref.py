@@ -41,7 +41,7 @@ Copy rate (--copy-seeds > 0, on generated images)
     For every evaluated designated sample (main k) and --copy-seeds seeds, an image is generated
     with main k designated (inputs in their original order), and for every folder one image
     without a main. Image-level CLIP features of the Kandinsky 2.2 prior (the encoder of
-    synthesize_v2_1.py / select_targets.py) are compared after the transformer is unloaded:
+    synthesize.py / select_targets.py) are compared after the transformer is unloaded:
         cos_main     cos(output, input_k)
         cos_target   max over the kept targets of main k of cos(output, target)
         copy         cos_main > cos_target: the output is closer to the main INPUT than to its
@@ -111,7 +111,7 @@ from train_multiref import DEVICE, DTYPE, build_transformer, forward_loss
 
 # fields of the training args that are paths
 PATH_ARGS = ("data_dir", "cache_dir", "output_dir", "resume")
-# image encoder for the copy rate (same features as synthesize_v2_1.py / select_targets.py)
+# image encoder for the copy rate (same features as synthesize.py / select_targets.py)
 CLIP_PRIOR = "kandinsky-community/kandinsky-2-2-prior"
 
 

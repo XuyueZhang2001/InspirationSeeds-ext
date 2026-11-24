@@ -3,7 +3,7 @@ synthesize_sweep.py -- designated-subject target candidates over a (t, strength,
 Last modified: 2026-11-24 (--attr-mains: also attribute inputs as mains)
 
 Generation step of the automatic target selection (selection: score_synth.py). Same method,
-models and measurements as synthesize_v2_1.py; what changes:
+models and measurements as synthesize.py; what changes:
 
 * Grid. Every main gets a t x strength x seed grid chosen by its class (close / far, as in v2.1),
   3 x 3 x 2 by default instead of 2 x 2 x 1. The centres of the grids are the v2.1 defaults:
@@ -18,7 +18,7 @@ models and measurements as synthesize_v2_1.py; what changes:
   --attr-mains (presence check of the main concept).
       --main-mode auto   score.json if the folder has one, otherwise every input (default)
       --main-mode score  folders without score.json are skipped
-      --main-mode all    every input (as synthesize_v2_1.py)
+      --main-mode all    every input (as synthesize.py)
       --mains 0,2        these indices in every folder (overrides --main-mode)
 * Incremental. Cells already on disk (same file name, same --size / --steps / --guidance-scale)
   are not generated again, so the grid can be extended later (more t / s values or seeds)
@@ -49,8 +49,8 @@ from diffusers.utils import load_image
 from PIL import Image
 from tqdm import tqdm
 
-from decompose import load_kandinsky
-from synthesize_v2_1 import (DEVICE, clip_feature, cos, find_folders, generate_img2img, generate_plain, list_inputs,
+from decompose_kmeans import load_kandinsky
+from synthesize import (DEVICE, clip_feature, cos, find_folders, generate_img2img, generate_plain, list_inputs,
                              make_overview, parse_float_list, parse_int_list, target_embedding)
 
 SWEEP_VERSION = 1

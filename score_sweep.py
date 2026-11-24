@@ -1,10 +1,10 @@
 """
-score_sweep.py -- score the decompose_v7_2.py folders of a sweep and pick, per source image, the folder for
+score_sweep.py -- score the decompose.py folders of a sweep and pick, per source image, the folder for
 the no-main pool (level 1) and the folder for the main pool (level 2, replaces screen_sources.py).
 Last modified: 2026-11-23
 
 Reads every folder with a groups.json under --sweep-root (run_sweep.sh writes
-<sweep-root>/topk64_c0.3_s1/<decompose_v7_2.py folder>/). decompose_v7_2.py is not changed. The source
+<sweep-root>/topk64_c0.3_s1/<decompose.py folder>/). decompose.py is not changed. The source
 image and the settings are read from groups.json, never from folder names.
 
 What a decomposition is supposed to show is not known in advance (the SAE groups have no names and a source
@@ -72,7 +72,7 @@ image never depend on other images):
       folders.csv, inputs.csv, summary.json    tables of every folder that has a score.json
     --export-no-main data/no_main      the no-main picks AND the main picks (a main pick must also be in the
                                        no-main pool, so build_dataset.py finds byte-identical inputs)
-    --export-main generate_source      the main picks (synthesize_v2_1.py reads them)
+    --export-main generate_source      the main picks (synthesize.py reads them)
   Export keeps the target in sync with the picks of the images scored in this run: new picks are copied
   (unchanged, under their own name); a folder this script exported earlier that is no longer a pick of its
   image is removed. Folders it did not export (listed in <target>/_exported.json) are never touched.
@@ -101,7 +101,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
-from decompose_v7_2 import IMAGE_EXTS
+from decompose import IMAGE_EXTS
 
 PRIOR = "kandinsky-community/kandinsky-2-2-prior"
 CONCEPT_TYPES = ("object", "material", "color", "shape", "pattern", "style", "scene")
@@ -134,7 +134,7 @@ LABEL_COLORS = {"unique": GREEN, "duplicate": ORANGE, "shared_concept": ORANGE}
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Score decompose_v7_2.py sweep folders: no-main and main picks")
+    p = argparse.ArgumentParser(description="Score decompose.py sweep folders: no-main and main picks")
     p.add_argument("--sweep-root", type=Path, default=Path("output/decompose/sweep"))
     src = p.add_mutually_exclusive_group()
     src.add_argument("--image", help="Only the folders of this source image")

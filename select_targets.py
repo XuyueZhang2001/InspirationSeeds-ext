@@ -1,5 +1,5 @@
 """
-select_targets.py -- suggest designated-subject targets for manual review (synthesize_v2_1.py outputs).
+select_targets.py -- suggest designated-subject targets for manual review (synthesize.py outputs).
 Last modified: 2026-11-19 (default paths under data/: --synth-root data/synth/v2_1, --output-dir data/selection)
                2026-11-17
 
@@ -89,7 +89,7 @@ GREEN, RED, BLUE, GRAY = (40, 160, 40), (210, 40, 40), (40, 90, 220), (120, 120,
 
 
 def cell_name(t: float, s: float) -> str:
-    """File stem of a cell, e.g. t0.30_s0.40 (same format as synthesize_v2_1.py)."""
+    """File stem of a cell, e.g. t0.30_s0.40 (same format as synthesize.py)."""
     return f"t{t:.2f}_s{s:.2f}"
 
 
@@ -103,7 +103,7 @@ def check_folder(meta: dict, args) -> dict:
                 continue
             missing = [f for f in REQUIRED_CELL_FIELDS if f not in c]
             if missing:
-                raise ValueError(f"cell without {missing}: not a synthesize_v2_1.py output ({meta.get('folder')})")
+                raise ValueError(f"cell without {missing}: not a synthesize.py output ({meta.get('folder')})")
             reasons = []
             if c["cos_main"] > args.copy_max:
                 reasons.append("copy")
@@ -268,7 +268,7 @@ def write_review_folder(review_dir: Path, folder: Path, synth_dir: Path, inputs,
 def main():
     p = argparse.ArgumentParser(description="Suggest designated-subject targets for manual review")
     p.add_argument("--synth-root", type=Path, default=Path("data/synth/v2_1"),
-                   help="Output root of synthesize_v2_1.py (searched recursively for synth_meta.json)")
+                   help="Output root of synthesize.py (searched recursively for synth_meta.json)")
     p.add_argument("--output-dir", type=Path, default=Path("data/selection"))
     p.add_argument("--copy-max", type=float, default=0.80, help="Suggest dropping cells with cos_main above this")
     p.add_argument("--lift-min", type=float, default=0.0, help="Suggest dropping cells with lift below this")
@@ -302,7 +302,7 @@ def main():
         inputs = list_inputs(folder)
         if len(inputs) != meta["n_inputs"]:
             print(f"[warn] {folder}: found {len(inputs)} input images, synth_meta.json says {meta['n_inputs']}; "
-                  "run from the directory where synthesize_v2_1.py was run")
+                  "run from the directory where synthesize.py was run")
             inputs = [folder / f"input_{i}.jpeg" for i in range(meta["n_inputs"])]
         per_main = check_folder(meta, args)
 

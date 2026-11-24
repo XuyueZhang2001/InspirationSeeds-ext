@@ -6,13 +6,13 @@ Last modified: 2026-11-24 (main kinds: object mains only by default, attribute m
                --copy-max 0.88 --dino-copy-max 0.94 --lift-min -0.03 --min-main 0 --min-fusion 0)
 
 Selection step of the automatic target selection; replaces the manual choice in select_targets.py.
-Works on the outputs of synthesize_sweep.py and of synthesize_v2_1.py (any folder with a
+Works on the outputs of synthesize_sweep.py and of synthesize.py (any folder with a
 synth_meta.json), so the hand-picked v2.1 selections can be used to calibrate it.
 
 Per candidate target T of main k (one cell = one t, strength, seed)
 -------------------------------------------------------------------
 Measurements (cached in <synth dir>/target_measure.json), CLIP = image encoder of the Kandinsky
-prior (as in synthesize_v2_1.py), DINO = DINOv2 (as in score_sweep.py), all cosine similarities:
+prior (as in synthesize.py), DINO = DINOv2 (as in score_sweep.py), all cosine similarities:
     cos_main   CLIP(T, input_k)
     dino_main  DINO(T, input_k)        structure / shape of the main (CLIP is mostly category)
     lift       cos_main - CLIP(input_k, recon)
@@ -135,7 +135,7 @@ EXPORT_MANIFEST = "_exported_synth.json"
 def parse_args():
     p = argparse.ArgumentParser(description="Pick one designated-subject target per main; calibrate on hand labels")
     p.add_argument("--synth-root", type=Path, default=Path("data/synth"),
-                   help="Searched recursively for synth_meta.json (synthesize_sweep.py or synthesize_v2_1.py)")
+                   help="Searched recursively for synth_meta.json (synthesize_sweep.py or synthesize.py)")
     p.add_argument("--decomp-root", type=Path, nargs="*", default=[],
                    help="Look up decomposition folders by name here first (e.g. generate_source_handpicked)")
     p.add_argument("--source-dir", type=Path, default=Path("samples/sources"),

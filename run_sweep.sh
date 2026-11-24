@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_sweep.sh -- run decompose_v7_2.py (unchanged) once per setting, then score_sweep.py.
+# run_sweep.sh -- run decompose.py (unchanged) once per setting, then score_sweep.py.
 # Run from the repository root.
 # Last modified: 2026-11-23
 #
@@ -8,12 +8,12 @@
 #
 # Settings (environment variables, space separated):
 #   OUT=output/decompose/sweep  TOPK="32 64 128"  CLEAN="0.3 0.5 0.7"  SEEDS="0 1 2"
-#   DECOMPOSE_ARGS="--steps 25"   further decompose_v7_2.py options
+#   DECOMPOSE_ARGS="--steps 25"   further decompose.py options
 #   e.g.  TOPK=64 CLEAN="0.3 0.7" SEEDS=1 ./run_sweep.sh samples/sources/14.jpeg   (quick test)
 #
-# Output: $OUT/topk<K>_c<clean>_s<seed>/<decompose_v7_2.py folders>, logs in $OUT/_logs/,
+# Output: $OUT/topk<K>_c<clean>_s<seed>/<decompose.py folders>, logs in $OUT/_logs/,
 #         review in $OUT/_review/ (see score_sweep.py). Existing folders are skipped by
-#         decompose_v7_2.py, so an interrupted sweep continues where it stopped.
+#         decompose.py, so an interrupted sweep continues where it stopped.
 # Score again with other thresholds without decomposing: python score_sweep.py --dup-clip 0.75
 set -u
 
@@ -32,7 +32,7 @@ for k in $TOPK; do
     for s in $SEEDS; do
       run="topk${k}_c${c}_s${s}"
       echo "== $run"
-      python decompose_v7_2.py "${SRC[@]}" --output-dir "$OUT/$run" \
+      python decompose.py "${SRC[@]}" --output-dir "$OUT/$run" \
           --top-k "$k" --clean-frac "$c" --seed "$s" $DECOMPOSE_ARGS > "$OUT/_logs/$run.log" 2>&1 \
         || echo "   FAILED, see $OUT/_logs/$run.log"
     done

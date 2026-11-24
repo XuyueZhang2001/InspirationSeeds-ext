@@ -4,14 +4,15 @@ This repository builds on [Inspiration Seeds](https://arxiv.org/abs/2602.08615) 
 
 The long-term goal of this fork is to support **N input images with an optional designated main subject** (earlier plan: controllable per-image weight levels). The repository now covers data generation and a first fine-tuning pipeline:
 
-1. decomposing a source image into **N semantically distinct reference images** (N = 2–4, chosen per image, 768 px): **`decompose_v7_2.py`** (adaptive SAE feature grouping + an image-space subject subspace), run over a grid of settings by **`run_sweep.sh`**;
+1. decomposing a source image into **N semantically distinct reference images** (N = 2–4, chosen per image, 768 px): **`decompose.py`** (adaptive SAE feature grouping + an image-space subject subspace), run over a grid of settings by **`run_sweep.sh`**;
 2. scoring the decompositions of the sweep and picking, per source image, one folder for the no-main pool and one for the main pool: **`score_sweep.py`** (CLIP / DINOv2 checks + a VLM; replaces the hand-picking and `screen_sources.py`);
-3. synthesizing **designated-subject target images** (1024 px): **`synthesize_v2_1.py`**: for every input designated as the main subject, a target pulled toward that input, so that the same input set gives different targets for different designations;
+3. synthesizing **designated-subject target images** (1024 px): **`synthesize.py`**: for every input designated as the main subject, a target pulled toward that input, so that the same input set gives different targets for different designations;
 4. selecting the targets by hand, with automatic suggestions: **`select_targets.py`**;
 5. building the training data: **`build_dataset.py`** and **`cache_features.py`**;
 6. fine-tuning FLUX.1 Kontext dev (new LoRA; the main image is marked by its position id) on 2–4 reference images with an optional main image: **`train_multiref.py`**; evaluation with **`eval_multiref.py`**, inference with **`generate_multi.py`**.
 
-Last README update: 2026-11-23 (sweep and automatic scoring: `run_sweep.sh`, `score_sweep.py`).
+Last README update: 2026-11-24 (scripts renamed: `decompose_v7_2.py` → `decompose.py`, `synthesize_v2_1.py` → `synthesize.py`, the earlier k-means `decompose.py` → `decompose_kmeans.py`).
+Earlier: 2026-11-23 (sweep and automatic scoring: `run_sweep.sh`, `score_sweep.py`).
 
 ---
 
@@ -21,15 +22,15 @@ Last README update: 2026-11-23 (sweep and automatic scoring: `run_sweep.sh`, `sc
 |---|---|
 | `generate.py` | Original inference script: combines two images with FLUX.1 Kontext + the released LoRA (unchanged) |
 | `decompose_original.py` | Original two-cluster decomposition script (unchanged, renamed) |
-| **`decompose_v7_2.py`** | **Recommended** decomposition: adaptive grouping of SAE features, coverage expansion, merging, shared-part weakening, subject kept in one input (see below) |
+| **`decompose.py`** | **Recommended** decomposition: adaptive grouping of SAE features, coverage expansion, merging, shared-part weakening, subject kept in one input (see below) |
 | `decompose_groups.py`, `decompose_v4.py` … `decompose_v7_1.py` | Earlier versions of the adaptive decomposition, kept for comparison (history below) |
-| `decompose.py` | Earlier fixed-K baseline (k-means into K = 2, 3, 4 clusters); no longer documented |
-| **`run_sweep.sh`** | Runs `decompose_v7_2.py` (unchanged) once per setting of a `--top-k` × `--clean-frac` × `--seed` grid, then `score_sweep.py` (see *Sweep and automatic scoring*) |
+| `decompose_kmeans.py` | Earlier fixed-K baseline (k-means into K = 2, 3, 4 clusters), formerly `decompose.py`; no longer documented, but keep it: it holds the shared loaders (`load_kandinsky`, `embed_image`, `load_sae`) imported by `decompose.py`, `synthesize.py` and the older scripts |
+| **`run_sweep.sh`** | Runs `decompose.py` (unchanged) once per setting of a `--top-k` × `--clean-frac` × `--seed` grid, then `score_sweep.py` (see *Sweep and automatic scoring*) |
 | **`score_sweep.py`** | Scores every folder of a sweep (CLIP / DINOv2 checks, Qwen3-VL main-subject probabilities), picks per source image the best no-main folder (level 1) and the best main folder (level 2), writes a review (`_review/`) and optionally exports the picks to `data/no_main/` and `generate_source/` |
 | `screen_sources.py` | Superseded by `score_sweep.py` (level 2). Earlier first pass over `data/no_main/`: folders with at least two distinct, source-related subjects were copied to `generate_source/screening/` for the manual choice of synthesis sources |
-| **`synthesize_v2_1.py`** | **Recommended** designated-subject target synthesis for `decompose_v7_2.py` outputs: closeness-dependent 2 × 2 grid of interpolation weight × img2img strength (see below) |
+| **`synthesize.py`** | **Recommended** designated-subject target synthesis for `decompose.py` outputs: closeness-dependent 2 × 2 grid of interpolation weight × img2img strength (see below) |
 | `synthesize_v2.py` | Previous version: the same synthesis with a full 3 × 3 grid for every main |
-| `synthesize_target.py` | Earlier level-based weighted target synthesis for `decompose.py` outputs |
+| `synthesize_target.py` | Earlier level-based weighted target synthesis for `decompose_kmeans.py` outputs |
 | **`select_targets.py`** | Suggests which synthesized targets to keep and writes review folders (`keep/`, `drop/`, `_overview.jpeg`) for the manual selection (see below) |
 | **`build_dataset.py`** | Training / validation manifests: unspecified samples (decomposition + source image) and designated samples (decomposition + kept targets) |
 | **`cache_features.py`** | Caches VAE latents (references 512 px, targets 1024 px) and the prompt embeddings, so training only needs the transformer |
@@ -53,19 +54,19 @@ All scripts are run from the repository root; the defaults of every script follo
 
 ```
 samples/sources/              source images (fetch_samples.py)
-output/decompose/sweep/       run_sweep.sh: raw decompose_v7_2.py runs, one subfolder per setting
-    topk<K>_c<clean>_s<seed>/<decompose_v7_2.py folders>   + measure.json, main_choice.json, score.json
+output/decompose/sweep/       run_sweep.sh: raw decompose.py runs, one subfolder per setting
+    topk<K>_c<clean>_s<seed>/<decompose.py folders>   + measure.json, main_choice.json, score.json
     _sources/                 score_sweep.py: VLM concept inventory per source image, same-kind cache
     _review/                  score_sweep.py: per-image sheets, overview pages, folders.csv, inputs.csv, summary.json
-    _logs/                    one decompose_v7_2.py log per setting
+    _logs/                    one decompose.py log per setting
     overrides.csv             (optional, by hand) replaces automatic picks of single images
-output/decompose/<run>/       other raw decompose_v7_2.py runs (nothing else goes to output/)
+output/decompose/<run>/       other raw decompose.py runs (nothing else goes to output/)
 data/no_main/                 unspecified pool: no-main AND main picks of score_sweep.py (--export-no-main),
                               plus folders copied by hand earlier
 generate_source/              synthesis sources: main picks of score_sweep.py (--export-main),
                               plus folders chosen by hand earlier
     _exported.json            (in both targets) folders written by score_sweep.py; others are never touched
-data/synth/                   synthesize_v2_1.py targets
+data/synth/                   synthesize.py targets
 data/selection/review/        select_targets.py review folders (manual keep / drop): the designated pool
 data/multiref/                build_dataset.py manifests + cache_features.py cache
 runs/                         training runs
@@ -74,7 +75,7 @@ runs/                         training runs
 ```bash
 SRC=samples/sources
 
-# 1. decomposition sweep (768 px inputs): decompose_v7_2.py for every top-k x clean-frac x seed
+# 1. decomposition sweep (768 px inputs): decompose.py for every top-k x clean-frac x seed
 #    setting, then score_sweep.py (review in output/decompose/sweep/_review/, nothing exported yet)
 ./run_sweep.sh $SRC                         # default grid: TOPK="32 64" CLEAN="0.3 0.5 0.7" SEEDS="0 1"
 
@@ -84,7 +85,7 @@ SRC=samples/sources
 python score_sweep.py --export-no-main data/no_main --export-main generate_source
 
 # 3. designated-subject targets (1024 px) for generate_source/
-python synthesize_v2_1.py                   # generate_source -> data/synth
+python synthesize.py                   # generate_source -> data/synth
 
 # 4. suggestions + manual selection in data/selection/review/<folder>/main<k>/keep|drop
 #    (criteria: Target selection, Selection criteria)
@@ -107,8 +108,8 @@ python generate_multi.py --folder data/no_main/<folder> --main 2 --lora runs/v1/
 
 | Step | Resolution |
 |---|---|
-| Decomposed inputs (`decompose_v7_2.py --size`) | 768 × 768 |
-| Synthesized targets (`synthesize_v2_1.py --size`) | 1024 × 1024 (inputs upsampled as img2img init images) |
+| Decomposed inputs (`decompose.py --size`) | 768 × 768 |
+| Synthesized targets (`synthesize.py --size`) | 1024 × 1024 (inputs upsampled as img2img init images) |
 | References in the model (`cache_features.py --ref-size`) | 512 × 512 (1024 tokens each), as in the original Inspiration Seeds |
 | Targets in the model (`cache_features.py --target-size`) and outputs | 1024 × 1024 (4096 tokens) |
 
@@ -120,7 +121,7 @@ python generate_multi.py --folder data/no_main/<folder> --main 2 --lora runs/v1/
 
 - An NVIDIA GPU is required (both scripts hard-code `cuda`).
 - `decompose*.py` (Kandinsky 2.2 + SAE): about 12–16 GB of VRAM.
-- `synthesize_v2_1.py` (Kandinsky 2.2 only, no SAE): at most the same as the decomposition.
+- `synthesize.py` (Kandinsky 2.2 only, no SAE): at most the same as the decomposition.
 - `generate.py`, `generate_multi.py`, `check_multiref.py` (FLUX.1 Kontext dev, ~12B parameters, bf16): about 24 GB+ of VRAM, or use `pipe.enable_model_cpu_offload()`.
 - `train_multiref.py` (transformer in bf16 + LoRA in fp32, gradient checkpointing, no quantization): developed on an 80 GB GPU; about 4 s per sample with 4 references and a 1024 px target. Single GPU; choose it with `CUDA_VISIBLE_DEVICES=1 python train_multiref.py ...`.
 - `cache_features.py` (VAE + text encoders, no transformer): less than the generation scripts.
@@ -168,7 +169,7 @@ Notes:
 
 ---
 
-## Recommended decomposition (`decompose_v7_2.py`)
+## Recommended decomposition (`decompose.py`)
 
 ### Goal
 
@@ -213,20 +214,20 @@ Steps 9–11 replaced two earlier ideas that did not work: weakening the subject
 
 ```bash
 # default setting (alpha_r 0.7, cleaning 0.3), no debug images
-python decompose_v7_2.py --image-dir samples/sources --output-dir output/decompose/v72
+python decompose.py --image-dir samples/sources --output-dir output/decompose/v72
 
 # one image, with diagnostic images
-python decompose_v7_2.py --image samples/sources/<name>.jpeg --output-dir output/decompose/v72_test --debug-images
+python decompose.py --image samples/sources/<name>.jpeg --output-dir output/decompose/v72_test --debug-images
 
 # another decoding seed (same embeddings, different renderings)
-python decompose_v7_2.py --image-dir samples/sources --output-dir output/decompose/v72_seed2 --seed 2
+python decompose.py --image-dir samples/sources --output-dir output/decompose/v72_seed2 --seed 2
 
 # other cleaning fraction / shared-part strength
-python decompose_v7_2.py --image-dir samples/sources --output-dir output/decompose/v72_c05 --clean-frac 0.5
+python decompose.py --image-dir samples/sources --output-dir output/decompose/v72_c05 --clean-frac 0.5
 
 # force the subject noun for some images
 echo '{"14": "kite", "phone_01": "smartphone"}' > subjects.json
-python decompose_v7_2.py --image-dir samples/sources --output-dir output/decompose/v72 --subject-map subjects.json
+python decompose.py --image-dir samples/sources --output-dir output/decompose/v72 --subject-map subjects.json
 ```
 
 Existing output folders are skipped unless `--overwrite` is given, so use a new `--output-dir` for every setting. The first time a noun is used, its subspace costs 2 × 40 × `--prior-samples` prior runs (batched); afterwards it is read from `text_cache/`.
@@ -255,15 +256,15 @@ The single-setting runs below were the earlier hand-run settings. They change on
 SRC=samples/sources          # source folder
 OUT=output/decompose          # one subfolder per run
 
-python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/base_s1 --seed 1
-python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/base_s2 --seed 2
-python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/base_s3 --seed 3
-python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/c05     --clean-frac 0.5
-python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/c02     --clean-frac 0.2
-python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/a10     --alpha-r 1.0
-python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/restore --subject-restore
-python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/obj03   --alpha-obj 0.3
-python decompose_v7_2.py --image-dir $SRC --output-dir $OUT/n2      --n-max 2
+python decompose.py --image-dir $SRC --output-dir $OUT/base_s1 --seed 1
+python decompose.py --image-dir $SRC --output-dir $OUT/base_s2 --seed 2
+python decompose.py --image-dir $SRC --output-dir $OUT/base_s3 --seed 3
+python decompose.py --image-dir $SRC --output-dir $OUT/c05     --clean-frac 0.5
+python decompose.py --image-dir $SRC --output-dir $OUT/c02     --clean-frac 0.2
+python decompose.py --image-dir $SRC --output-dir $OUT/a10     --alpha-r 1.0
+python decompose.py --image-dir $SRC --output-dir $OUT/restore --subject-restore
+python decompose.py --image-dir $SRC --output-dir $OUT/obj03   --alpha-obj 0.3
+python decompose.py --image-dir $SRC --output-dir $OUT/n2      --n-max 2
 ```
 
 Resulting layout: `output/decompose/<run>/<stem>_topk64_s{seed}_c{c}_a{a}_obj{obj}/` (e.g. `output/decompose/c05/14_topk64_s1_c0.5_a0.7_obj0.5/`) with `input_*.jpeg`, `overview.jpeg`, `embeds.pt`, `groups.json`, plus `output/decompose/<run>/summary.json`. For one source image there are therefore up to 9 candidate input sets; comparing the `overview.jpeg` of the same `<stem>` across runs is the quickest visual check. Earlier, the good folders of all runs were copied by hand (flat, the folder names differ between settings) to `data/no_main/`, the unspecified pool of `build_dataset.py`; folders copied this way stay there and are never touched by the export of `score_sweep.py`. The `restore` and `n2` runs have the same folder names as `base_s1`, so only one of these three versions of a source can be kept in `data/no_main/`.
@@ -385,7 +386,7 @@ One folder per image: `<output-dir>/{image stem}_topk{top-k}_s{seed}_c{clean-fra
 | Version | Change |
 |---|---|
 | `decompose_original.py` | Paper: k-means into 2 clusters, cleaning, $e \pm \lambda(d_1 - d_0)$ |
-| `decompose.py` | K clusters, one-vs-rest directions (fixed-K baseline) |
+| `decompose_kmeans.py` (formerly `decompose.py`) | K clusters, one-vs-rest directions (fixed-K baseline) |
 | `decompose_groups.py` v1 | Adaptive grouping (FINCH + ConceptExpress threshold) |
 | v2 | Quantile threshold capped at 0.9 (max-based threshold merged everything) |
 | v3 | Main/minor groups, cleaning, "remove other groups" inputs ($\beta$, $\gamma$), 50 steps / 768 px |
@@ -394,7 +395,7 @@ One folder per image: `<output-dir>/{image stem}_topk{top-k}_s{seed}_c{clean-fra
 | `decompose_v6.py` | Weakening of the whole shared part (`--alpha-r`) |
 | `decompose_v7.py` | Subject subspace from CLIP text deltas, separate subject input |
 | `decompose_v7_1.py` | Subject subspace from prior-predicted image embeddings |
-| **`decompose_v7_2.py`** | Subject kept in one input (keeper), weakened in the others; separate subject input removed |
+| **`decompose.py`** (formerly `decompose_v7_2.py`) | Subject kept in one input (keeper), weakened in the others; separate subject input removed |
 
 ---
 
@@ -407,7 +408,7 @@ Every source image is decomposed with several settings, and the right setting de
 - a **no-main pick** (level 1): all inputs are different, come from the source and each clearly shows its own concept. Used as an unspecified sample (target = the source image).
 - a **main pick** (level 2): a level-1 folder in which at least two inputs each show a different, prominent object. Used as a synthesis source for designated-subject targets (replaces `screen_sources.py` and the manual move to `generate_source/`).
 
-`decompose_v7_2.py` is not changed. The picks of one image never depend on other images.
+`decompose.py` is not changed. The picks of one image never depend on other images.
 
 ### Sweep (`run_sweep.sh`)
 
@@ -423,9 +424,9 @@ TOPK=64 CLEAN="0.3 0.7" SEEDS=1 ./run_sweep.sh samples/sources/14.jpeg   # quick
 | `TOPK` | `"32 64"` | `--top-k` values |
 | `CLEAN` | `"0.3 0.5 0.7"` | `--clean-frac` values |
 | `SEEDS` | `"0 1"` | `--seed` values |
-| `DECOMPOSE_ARGS` | – | Further `decompose_v7_2.py` options for every run, e.g. `"--steps 25"` |
+| `DECOMPOSE_ARGS` | – | Further `decompose.py` options for every run, e.g. `"--steps 25"` |
 
-The defaults give 2 × 3 × 2 = 12 folders per source image in `$OUT/topk<K>_c<clean>_s<seed>/`, logs in `$OUT/_logs/`. Existing folders are skipped by `decompose_v7_2.py`, so an interrupted sweep continues where it stopped. At the end `score_sweep.py` runs on the images of the sweep **without export**.
+The defaults give 2 × 3 × 2 = 12 folders per source image in `$OUT/topk<K>_c<clean>_s<seed>/`, logs in `$OUT/_logs/`. Existing folders are skipped by `decompose.py`, so an interrupted sweep continues where it stopped. At the end `score_sweep.py` runs on the images of the sweep **without export**.
 
 `--seed` only changes the Kandinsky decoding: the SAE grouping (`groups.json`) depends on `--top-k` and `--clean-frac` only, so the seed axis gives another rendering of the same decomposition (the default grid has 6 different groupings per image).
 
@@ -528,11 +529,11 @@ The review covers every folder that has a `score.json` of the current script ver
 
 Main picks also go to `data/no_main/`, so that `build_dataset.py` finds byte-identical inputs for the designated samples synthesized on `generate_source/`.
 
-> **Freeze the picks before synthesis.** The review folders of `select_targets.py` refer to the inputs in `generate_source/<folder>/`. If a later rescoring (other thresholds, more seeds) changes a main pick and is exported, the old folder is deleted from `generate_source/` and `data/no_main/`, and the designated samples synthesized on it lose their inputs. Once `synthesize_v2_1.py` has run on a pick, keep it with `overrides.csv`, or export to new folders.
+> **Freeze the picks before synthesis.** The review folders of `select_targets.py` refer to the inputs in `generate_source/<folder>/`. If a later rescoring (other thresholds, more seeds) changes a main pick and is exported, the old folder is deleted from `generate_source/` and `data/no_main/`, and the designated samples synthesized on it lose their inputs. Once `synthesize.py` has run on a pick, keep it with `overrides.csv`, or export to new folders.
 
 ---
 
-## Designated-subject target synthesis (`synthesize_v2_1.py`)
+## Designated-subject target synthesis (`synthesize.py`)
 
 ### Goal
 
@@ -547,7 +548,7 @@ Designating different inputs of the same input set gives different targets, i.e.
 
 ### Method
 
-Input: decomposition folders written by `decompose_v7_2.py` (2–4 inputs per folder): `embeds.pt` (`e`, `e_inputs`), `input_0.jpeg` …, `recon.jpeg`, and optionally `groups.json` (subject and keeper, only used for display). $f(\cdot)$ is the CLIP image encoder of the Kandinsky 2.2 prior.
+Input: decomposition folders written by `decompose.py` (2–4 inputs per folder): `embeds.pt` (`e`, `e_inputs`), `input_0.jpeg` …, `recon.jpeg`, and optionally `groups.json` (subject and keeper, only used for display). $f(\cdot)$ is the CLIP image encoder of the Kandinsky 2.2 prior.
 
 1. **Closeness of every input to the source** (before any generation):
    $$\text{closeness}_k = \cos\big(f(\texttt{input\_k.jpeg}),\ f(\texttt{recon.jpeg})\big)$$
@@ -579,27 +580,27 @@ Input: decomposition folders written by `decompose_v7_2.py` (2–4 inputs per fo
 - Hand-picked cells had `cos_main` 0.52–0.78 and `margin` down to −0.15. Using "`cos_main` ≤ 0.8 and `margin` ≥ −0.15" as a criterion, 26 of 27 far mains have at least one usable cell with $s \in \{0.4, 0.7\}$, the same as with the full 3 × 3 grid; with $s \in \{0.7, 0.9\}$ only 21 of 27.
 - The default grids contain 6 of the 7 hand-picked cells; the missing one, (0.6, 0.9), had almost the same values as (0.6, 0.7).
 
-In this analysis the closeness was approximated from `synthesize_v2.py` outputs; `synthesize_v2_1.py` computes it directly, so the threshold may need a small adjustment after the first run.
+In this analysis the closeness was approximated from `synthesize_v2.py` outputs; `synthesize.py` computes it directly, so the threshold may need a small adjustment after the first run.
 
 ### Usage
 
 ```bash
 # default: class-dependent 2 x 2 grid for every input of every folder, 1024 px targets
-python synthesize_v2_1.py --root generate_source --output-dir data/synth
+python synthesize.py --root generate_source --output-dir data/synth
 
 # try the first 3 folders only
-python synthesize_v2_1.py --limit 3
+python synthesize.py --limit 3
 
 # other threshold, or an intermediate strength for far mains
-python synthesize_v2_1.py --close-threshold 0.65
-python synthesize_v2_1.py --far-s 0.4,0.55,0.7
+python synthesize.py --close-threshold 0.65
+python synthesize.py --far-s 0.4,0.55,0.7
 
 # only inputs 0 and 2 as main subject, with a reference column without init image
-python synthesize_v2_1.py --mains 0,2 --embed-only
+python synthesize.py --mains 0,2 --embed-only
 
 # treat every input as far (threshold above 1) or as close (threshold 0)
-python synthesize_v2_1.py --close-threshold 1.1
-python synthesize_v2_1.py --close-threshold 0
+python synthesize.py --close-threshold 1.1
+python synthesize.py --close-threshold 0
 ```
 
 Folders that already contain `synth_meta.json` are skipped unless `--overwrite` is given. At the end, the terminal prints the number of targets, how many mains were close / far, the min / median / max closeness, and in how many folders the dominant input is the keeper.
@@ -654,9 +655,9 @@ One folder per decomposition folder: `<output-dir>/<name>/`.
 
 | Script | Change |
 |---|---|
-| `synthesize_target.py` | Per-image levels (`low` / `medium` / `high` = 1 / 3 / 9), $c_i = w_i / m_i$, $e_{target} = r + \sum_i c_i d_i$, rank check; only for `decompose.py` outputs |
-| `synthesize_v2.py` | Designated main subject: $e_T = (1-t)\,e + t\,e_k$ decoded by img2img from the main input; full 3 × 3 grid ($t \in \{0, 0.3, 0.6\}$, $s \in \{0.4, 0.7, 0.9\}$) for every main; reads `decompose_v7_2.py` outputs |
-| **`synthesize_v2_1.py`** | Closeness to the source decides a 2 × 2 grid per main (close / far); `lift` and `margin` replace the averaged shift |
+| `synthesize_target.py` | Per-image levels (`low` / `medium` / `high` = 1 / 3 / 9), $c_i = w_i / m_i$, $e_{target} = r + \sum_i c_i d_i$, rank check; only for `decompose_kmeans.py` outputs |
+| `synthesize_v2.py` | Designated main subject: $e_T = (1-t)\,e + t\,e_k$ decoded by img2img from the main input; full 3 × 3 grid ($t \in \{0, 0.3, 0.6\}$, $s \in \{0.4, 0.7, 0.9\}$) for every main; reads `decompose.py` outputs |
+| **`synthesize.py`** (formerly `synthesize_v2_1.py`) | Closeness to the source decides a 2 × 2 grid per main (close / far); `lift` and `margin` replace the averaged shift |
 
 ---
 
@@ -736,7 +737,7 @@ python select_targets.py --synth-root data/synth --output-dir data/selection
 
 | Argument | Default | Description |
 |---|---|---|
-| `--synth-root` | `data/synth` | Output root of `synthesize_v2_1.py` (searched for `synth_meta.json`) |
+| `--synth-root` | `data/synth` | Output root of `synthesize.py` (searched for `synth_meta.json`) |
 | `--output-dir` | `data/selection` | Review folders, `suggestions.csv`, `summary.json` |
 | `--copy-max`, `--lift-min`, `--margin-min`, `--distinct-min` | 0.80, 0.0, −0.15, 0.03 | Thresholds of the suggestions |
 | `--overview-tile` | 288 | Image size in `_overview.jpeg` |
@@ -1130,7 +1131,7 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 
 ## Known issues
 
-### Adaptive decomposition (`decompose_v7_2.py`)
+### Adaptive decomposition (`decompose.py`)
 
 1. **Content removed from every input.** Minor groups, ambiguous (cleaned) features ($\beta = 1$) and the weakened subject in non-keeper inputs are subtracted from all inputs; small objects that land there appear in no input. A planned fix is to assign them to exactly one input and to check coverage per noun.
 2. **One subject per image.** Only the top-1 noun is handled; multi-object scenes have several subjects, and the retrieved one may be a minor object.
@@ -1145,7 +1146,7 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 4. **Two unspecified samples per source.** If the no-main pick and the main pick of an image differ, both go to `data/no_main/` with the same target (the source image), so that source counts twice in the unspecified pool. Folders copied by hand earlier add to this.
 5. **Export deletes folders** that are no longer picks (see *Export*), including synthesis sources that already have designated targets.
 
-### Designated-subject synthesis (`synthesize_v2_1.py`)
+### Designated-subject synthesis (`synthesize.py`)
 
 1. **Provisional grids and threshold.** The close / far threshold and both 2 × 2 grids come from 7 hand-picked cells on 14 folders.
 2. **Coarse measurements.** `cos_main`, `lift` and `margin` use global CLIP features: they show whether the target moved toward the main, but cannot tell $s = 0.7$ from $s = 0.9$ (shape and layout), so `select_targets.py` only suggests and the final selection is manual. Its thresholds were not recalibrated for 1024 px targets.
