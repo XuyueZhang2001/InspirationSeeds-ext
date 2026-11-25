@@ -6,12 +6,13 @@ The long-term goal of this fork is to support **N input images with an optional 
 
 1. decomposing a source image into **N semantically distinct reference images** (N = 2–4, chosen per image, 768 px): **`decompose.py`** (adaptive SAE feature grouping + an image-space subject subspace), run over a grid of settings by **`run_sweep.sh`**;
 2. scoring the decompositions of the sweep and picking, per source image, one folder for the no-main pool and one for the main pool: **`score_sweep.py`** (CLIP / DINOv2 checks + a VLM; replaces the hand-picking and `screen_sources.py`);
-3. synthesizing **designated-subject target images** (1024 px): **`synthesize.py`**: for every input designated as the main subject, a target pulled toward that input, so that the same input set gives different targets for different designations;
-4. selecting the targets by hand, with automatic suggestions: **`select_targets.py`**;
+3. synthesizing **designated-subject target candidates** (1024 px): **`synthesize_sweep.py`** (the method of `synthesize.py` over a t × strength × seed grid): for every input designated as the main subject, targets pulled toward that input, so that the same input set gives different targets for different designations;
+4. picking **one target per main automatically**: **`score_synth.py`** (CLIP / DINOv2 checks + a VLM, calibrated on the earlier hand selection; object and attribute mains); the manual selection with **`select_targets.py`** remains available;
 5. building the training data: **`build_dataset.py`** and **`cache_features.py`**;
 6. fine-tuning FLUX.1 Kontext dev (new LoRA; the main image is marked by its position id) on 2–4 reference images with an optional main image: **`train_multiref.py`**; evaluation with **`eval_multiref.py`**, inference with **`generate_multi.py`**.
 
-Last README update: 2026-11-24 (scripts renamed: `decompose_v7_2.py` → `decompose.py`, `synthesize_v2_1.py` → `synthesize.py`, the earlier k-means `decompose.py` → `decompose_kmeans.py`).
+Last README update: 2026-11-24 (automatic target selection: `synthesize_sweep.py`, `score_synth.py`, attribute mains on by default).
+Earlier: 2026-11-24 (scripts renamed: `decompose_v7_2.py` → `decompose.py`, `synthesize_v2_1.py` → `synthesize.py`, the earlier k-means `decompose.py` → `decompose_kmeans.py`).
 Earlier: 2026-11-23 (sweep and automatic scoring: `run_sweep.sh`, `score_sweep.py`).
 
 ---
@@ -28,10 +29,12 @@ Earlier: 2026-11-23 (sweep and automatic scoring: `run_sweep.sh`, `score_sweep.p
 | **`run_sweep.sh`** | Runs `decompose.py` (unchanged) once per setting of a `--top-k` × `--clean-frac` × `--seed` grid, then `score_sweep.py` (see *Sweep and automatic scoring*) |
 | **`score_sweep.py`** | Scores every folder of a sweep (CLIP / DINOv2 checks, Qwen3-VL main-subject probabilities), picks per source image the best no-main folder (level 1) and the best main folder (level 2), writes a review (`_review/`) and optionally exports the picks to `data/no_main/` and `generate_source/` |
 | `screen_sources.py` | Superseded by `score_sweep.py` (level 2). Earlier first pass over `data/no_main/`: folders with at least two distinct, source-related subjects were copied to `generate_source/screening/` for the manual choice of synthesis sources |
-| **`synthesize.py`** | **Recommended** designated-subject target synthesis for `decompose.py` outputs: closeness-dependent 2 × 2 grid of interpolation weight × img2img strength (see below) |
+| **`synthesize_sweep.py`** | **Recommended** designated-subject target candidates: the method of `synthesize.py` over a 3 × 3 × 2 (t × strength × seed) grid per main, mains from `score.json` (object and attribute inputs) (see *Automatic target selection*) |
+| **`score_synth.py`** | **Recommended** automatic choice of one target per main (gates + score, VLM main-subject / presence checks), review images, export to `data/selection/review/` for `build_dataset.py`; calibration against hand labels (see *Automatic target selection*) |
+| `synthesize.py` | Designated-subject target synthesis for `decompose.py` outputs: closeness-dependent 2 × 2 grid of interpolation weight × img2img strength (see below); its outputs with the manual selection were the calibration data of `score_synth.py` |
 | `synthesize_v2.py` | Previous version: the same synthesis with a full 3 × 3 grid for every main |
 | `synthesize_target.py` | Earlier level-based weighted target synthesis for `decompose_kmeans.py` outputs |
-| **`select_targets.py`** | Suggests which synthesized targets to keep and writes review folders (`keep/`, `drop/`, `_overview.jpeg`) for the manual selection (see below) |
+| `select_targets.py` | Manual selection (alternative to `score_synth.py`): suggests which `synthesize.py` targets to keep and writes review folders (`keep/`, `drop/`, `_overview.jpeg`) (see below) |
 | **`build_dataset.py`** | Training / validation manifests: unspecified samples (decomposition + source image) and designated samples (decomposition + kept targets) |
 | **`cache_features.py`** | Caches VAE latents (references 512 px, targets 1024 px) and the prompt embeddings, so training only needs the transformer |
 | **`train_multiref.py`** | LoRA fine-tuning of FLUX.1 Kontext dev with 2–4 references and an optional main image (default: marked by position id $t = 3$); pool schedule, designation gap, validation images, checkpoints, overfitting test |
@@ -66,8 +69,14 @@ data/no_main/                 unspecified pool: no-main AND main picks of score_
 generate_source/              synthesis sources: main picks of score_sweep.py (--export-main),
                               plus folders chosen by hand earlier
     _exported.json            (in both targets) folders written by score_sweep.py; others are never touched
-data/synth/                   synthesize.py targets
-data/selection/review/        select_targets.py review folders (manual keep / drop): the designated pool
+data/synth/                   synthesize_sweep.py candidates: <folder>/main<k>/t*_s*_seed*.jpeg, synth_meta.json,
+                              + target_measure.json, target_vlm.json, input_choice.json (score_synth.py caches)
+    _sources/                 score_synth.py: source inventories (copied from the sweep or asked)
+    _review/                  score_synth.py: per-folder sheets, overview pages, cells.csv, picks.csv, summary.json
+    overrides.csv             (optional, by hand) replaces automatic picks: folder,main,cell
+data/selection/review/        designated pool: score_synth.py export (one target per main in main<k>/keep/,
+                              other candidates in drop/; _exported_synth.json) or select_targets.py review
+                              folders (manual keep / drop); same layout, read by build_dataset.py
 data/multiref/                build_dataset.py manifests + cache_features.py cache
 runs/                         training runs
 ```
@@ -84,12 +93,15 @@ SRC=samples/sources
 #    no-main + main picks -> data/no_main/ (unspecified pool), main picks -> generate_source/
 python score_sweep.py --export-no-main data/no_main --export-main generate_source
 
-# 3. designated-subject targets (1024 px) for generate_source/
-python synthesize.py                   # generate_source -> data/synth
+# 3. designated-subject target candidates (1024 px) for generate_source/: 3 x 3 x 2 grid per main
+#    (object and attribute mains from score.json; incremental, an interrupted run continues)
+python synthesize_sweep.py --gpus 0-7       # generate_source -> data/synth, one process per GPU
 
-# 4. suggestions + manual selection in data/selection/review/<folder>/main<k>/keep|drop
-#    (criteria: Target selection, Selection criteria)
-python select_targets.py                    # data/synth -> data/selection
+# 4. one target per main: check data/synth/_review/overview_*.jpeg, correct single mains in
+#    data/synth/overrides.csv if needed (seconds, everything is cached), then export the picks
+python score_synth.py --synth-root data/synth --gpus 0-7
+python score_synth.py --synth-root data/synth --export-review data/selection/review
+#    (manual alternative: python synthesize.py, then python select_targets.py, see Target selection)
 
 # 5. training data: manifests and cached latents / prompt embeddings
 python build_dataset.py                     # data/no_main + data/selection/review -> data/multiref
@@ -529,7 +541,7 @@ The review covers every folder that has a `score.json` of the current script ver
 
 Main picks also go to `data/no_main/`, so that `build_dataset.py` finds byte-identical inputs for the designated samples synthesized on `generate_source/`.
 
-> **Freeze the picks before synthesis.** The review folders of `select_targets.py` refer to the inputs in `generate_source/<folder>/`. If a later rescoring (other thresholds, more seeds) changes a main pick and is exported, the old folder is deleted from `generate_source/` and `data/no_main/`, and the designated samples synthesized on it lose their inputs. Once `synthesize.py` has run on a pick, keep it with `overrides.csv`, or export to new folders.
+> **Freeze the picks before synthesis.** `synth_meta.json` and the review folders of `score_synth.py` / `select_targets.py` refer to the inputs in `generate_source/<folder>/`. If a later rescoring (other thresholds, more seeds) changes a main pick and is exported, the old folder is deleted from `generate_source/` and `data/no_main/`, and the designated samples synthesized on it lose their inputs. Once `synthesize_sweep.py` (or `synthesize.py`) has run on a pick, keep it with `overrides.csv`, or export to new folders.
 
 ---
 
@@ -545,6 +557,8 @@ The per-image weight levels (`high` / `medium` / `low`) of the earlier `synthesi
 | Designated | decomposed inputs | input $k$ | a synthesized image pulled toward input $k$ (this script) |
 
 Designating different inputs of the same input set gives different targets, i.e. **counterfactual samples**: the model has to read the designation instead of inferring the main subject from the images. The designated input should dominate the target and keep its rough shape and pose, while the other inputs still contribute; its exact shape does not have to be preserved (a designed sofa need not match the input sofa), and its category does not have to be preserved either.
+
+> In the recommended pipeline this method runs over a larger grid in `synthesize_sweep.py`, and one target per main is picked automatically by `score_synth.py` (see *Automatic target selection*). `synthesize.py` with the manual selection of `select_targets.py` remains available.
 
 ### Method
 
@@ -663,6 +677,8 @@ One folder per decomposition folder: `<output-dir>/<name>/`.
 
 ## Target selection (`select_targets.py`)
 
+> Manual alternative to the automatic selection of `score_synth.py` (see *Automatic target selection*). Its review folders of the `synthesize.py` outputs are also the hand labels for the calibration of `score_synth.py`.
+
 ### Principle
 
 The script only **suggests** which synthesized cells to keep; the final choice is made by hand. The global CLIP measurements can filter out clear failures, but they cannot tell which of the remaining cells is best (e.g. $s = 0.7$ vs $0.9$), so every cell left in `keep/` is used as a target and training picks one of them at random.
@@ -745,6 +761,148 @@ python select_targets.py --synth-root data/synth --output-dir data/selection
 
 ---
 
+## Automatic target selection (`synthesize_sweep.py`, `score_synth.py`)
+
+### Goal
+
+Replace the manual choice of `select_targets.py` by an automatic one, as `score_sweep.py` did for the decompositions: generate the targets of every main over a parameter grid, check what every candidate shows, and keep **one target per main**. `synthesize_sweep.py` generates, `score_synth.py` selects; all measurements and VLM answers are cached, so changing a threshold takes seconds. Only `data/synth/overrides.csv` is left for corrections by hand.
+
+### Candidates (`synthesize_sweep.py`)
+
+Same method, models and measurements as `synthesize.py` (closeness class of every main, $e_T = (1-t)\,e + t\,e_k$, img2img from the main input), but a larger grid around the v2.1 defaults:
+
+| Class | $t$ | strength $s$ |
+|---|---|---|
+| close (closeness ≥ 0.6) | 0, 0.15, 0.3 | 0.6, 0.75, 0.9 |
+| far | 0.3, 0.45, 0.6 | 0.4, 0.55, 0.7 |
+
+× `--seeds` 0, 1 (the seeds of the default decomposition sweep) = 18 candidates per main.
+
+- **Mains** come from `score.json` of the decomposition folder (`score_sweep.py`): the unique inputs whose own concept is an **object** (`own_p` ≥ `--prominent`, 0.5) and, by default, the unique inputs whose own concept is an **attribute** (material, color, shape, pattern, style, scene). `--no-attr-mains`: object inputs only. Folders without `score.json`: every input (`--main-mode auto`; `score` skips them, `all` takes every input).
+- **Incremental**: cells already on disk with the same `--size` / `--steps` / `--guidance-scale` are not generated again; the grid can be extended later and an interrupted run continues.
+- **Batched**: the cells of one main with the same strength share the init image and the number of denoising steps and are generated in one img2img call (3 t × 2 seeds = 6 images, `--batch-size`); every image keeps its own seeded generator, so the noise is that of a single-image call.
+- **Several GPUs**: `--gpus 2,3` (or `0-7`) starts one process per listed GPU and splits the folders round-robin between them; logs in `data/synth/_logs/shard_<i>of<n>.log`, summaries merged into `sweep_summary.json` at the end. `--gpus 3` runs one process on GPU 3. `--shard i/n` processes only the i-th of n parts (0-based), e.g. to start the parts by hand in separate terminals. On one A100 a single image already uses the GPU fully, so batching gains little; the speed-up comes from the number of GPUs.
+- Files: `data/synth/<folder>/main<k>/t{t}_s{s}_seed{seed}.jpeg`, `synth_meta.json` (layout of v2.1, plus `seed` per cell), `overview.jpeg`.
+
+```bash
+python synthesize_sweep.py                  # generate_source -> data/synth
+python synthesize_sweep.py --limit 3        # quick test
+python synthesize_sweep.py --seeds 1        # half the cost: one seed
+python synthesize_sweep.py --no-attr-mains  # object mains only
+python synthesize_sweep.py --gpus 3         # one process on GPU 3
+python synthesize_sweep.py --gpus 2,3       # two processes on GPUs 2 and 3, folders split between them
+```
+
+### Main kinds
+
+The own concept of the main input (same multiple-choice question as `score_sweep.py`, over the inventory of the source image) decides how a target is checked:
+
+| Kind | Own concept | Main check on the target |
+|---|---|---|
+| object | type `object` | **multiple choice** "which ONE is the main subject?": the main concept must be the most likely answer (`main_not_top`); `p_main` = its probability |
+| attribute | material, color, shape, pattern, style, scene | **presence** "does this image show the color *mint green*?": `p_main` = P(yes) ≥ `--min-attr` (`attr_weak`) |
+| unknown | "none of these" | no pick (`main_unknown`) |
+
+A color or pattern is never "the main subject" of an image that shows an object, so the multiple-choice question rejects attribute targets that clearly carry the main (e.g. the colour and stripes of the main on a bowl). By default both kinds can get a pick; `--no-attr-mains` restricts the picks to object mains (attribute mains then fail `attr_main`).
+
+### Measurements, gates and score
+
+Per candidate $T$ of main $k$ (CLIP = image encoder of the Kandinsky prior, DINO = DINOv2):
+
+| Measurement | Definition |
+|---|---|
+| `cos_main`, `dino_main` | CLIP / DINO cosine of $T$ and input $k$ (DINO: shape and structure) |
+| `lift` | `cos_main` − CLIP(input $k$, recon) |
+| `p_main` | see *Main kinds* |
+| `fusion` | mean presence P(yes) of the other inputs' own concepts in $T$ |
+| `distinct` | `cos_main` − max over the other mains $j$ of CLIP(pick of main $j$, input $k$) |
+
+| Gate | Condition (default) |
+|---|---|
+| `copy` | `cos_main` > `--copy-max` (0.88) or `dino_main` > `--dino-copy-max` (0.94) |
+| `no_effect` | `lift` < `--lift-min` (−0.03) |
+| `main_unknown`, `attr_main` | see *Main kinds* |
+| `main_not_top` | object main: the main concept is not the most likely main subject of $T$ |
+| `main_weak` | object main: `p_main` < `--min-main` (0 = off; same cells as `main_not_top`) |
+| `attr_weak` | attribute main: `p_main` < `--min-attr` (0.8) |
+| `no_fusion` | every other concept has presence < `--min-fusion` (0 = off) |
+| `not_distinct` | `distinct` < `--distinct-min` (0) |
+
+The VLM is only asked about candidates that pass `copy` / `no_effect`. Among the candidates that pass every gate, the pick of main $k$ maximizes
+
+$$\text{score} = p_{main} + w_{struct}\,\text{dino\_main} + w_{fuse}\,\text{fusion} + w_{dist}\,\text{distinct}\qquad (w = 1, 1, 1)$$
+
+`distinct` depends on the picks of the other mains, so the picks are refined for a few rounds until they no longer change. `data/synth/overrides.csv` (`folder,main,cell`; cell = a file stem such as `t0.30_s0.55_seed0`, or `none`) replaces automatic picks.
+
+### Usage
+
+```bash
+python score_synth.py --synth-root data/synth                    # review in data/synth/_review/
+python score_synth.py --synth-root data/synth --gpus 0-7         # first run: VLM answers on 8 GPUs
+python score_synth.py --synth-root data/synth --no-attr-mains    # object mains only
+python score_synth.py --synth-root data/synth --export-review data/selection/review
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `--synth-root` | `data/synth` | Searched for `synth_meta.json` (`synthesize_sweep.py` or `synthesize.py` outputs) |
+| `--decomp-root` | – | Look up decomposition folders by name here first (needed when the folder stored in `synth_meta.json` was renamed) |
+| `--inventory-dir` | `output/decompose/sweep/_sources` | Source inventories of `score_sweep.py`, reused if model and prompt match |
+| `--attr-mains` / `--no-attr-mains` | on | Admit attribute mains |
+| `--min-attr` | 0.8 | Presence threshold of attribute mains |
+| `--copy-max`, `--dino-copy-max`, `--lift-min`, `--min-main`, `--min-fusion`, `--distinct-min` | 0.88, 0.94, −0.03, 0, 0, 0 | Gates (see above) |
+| `--w-struct`, `--w-fuse`, `--w-dist` | 1, 1, 1 | Score weights |
+| `--vlm-all` | off | Ask the VLM also about candidates that fail `copy` / `no_effect` (always on with `--labels`) |
+| `--no-vlm` | off | CLIP / DINOv2 only: score = `margin` + $w_{struct}$ `dino_main`, no VLM gates |
+| `--labels`, `--fit-weights` | – | Calibration against hand labels (see below) |
+| `--export-review` | – | Write the picks as review folders (layout below) |
+| `--export-drop` | `link` | Other candidates in `main<k>/drop/`: symlinks (no extra disk space), `copy`, or `none` |
+| `--remeasure`, `--reask` | off | Ignore the cached measurements / VLM answers |
+| `--gpus` | – | `3`: everything on GPU 3; `2,3` / `0-7`: measurements and VLM answers in one process per GPU (folders split round-robin, logs in `<synth-root>/_logs/score_shard_<i>of<n>.log`), then selection / review / export in this process from the caches |
+| `--shard`, `--cache-only` | – | `i/n`: only the i-th of n parts of the folders; only fill the caches (used by `--gpus`, can be started by hand) |
+
+**Speed.** Only the first run is slow: the VLM answers about 1 + (number of other inputs) questions per candidate that passes `copy` / `no_effect`, about 0.1–0.2 s per candidate on one A100, so tens of minutes for the whole sweep on one GPU; `--gpus` divides this by the number of GPUs. Later runs (other thresholds, weights, overrides, export) only read the caches and take a minute or two, mostly for drawing the review sheets; CLIP / DINOv2 and the VLM are not even loaded then. `score_synth.py` reads only folders with a finished `synth_meta.json`, so it can already fill the caches on a free GPU while `synthesize_sweep.py` is still running; a later run only adds the new folders.
+
+Output in `<synth-root>/_review/`: `<folder>.jpeg` (every candidate of every main: pick green, passed blue, failed red with the reasons), `overview_XX.jpeg` (one row per main: main input, pick, recon, other inputs), `cells.csv`, `picks.csv`, `summary.json` (picks per main kind, fail reasons, picked t / s / seed).
+
+**Export.** `--export-review DIR` writes review folders in the layout of `select_targets.py`, read by `build_dataset.py` unchanged (it only uses `info.json` and the files in `keep/`):
+
+```
+data/selection/review/<folder>/
+    info.json          decomposition folder, inputs, every candidate, the picks, main kinds, settings
+    _inputs.jpeg       all inputs of the folder
+    _overview.jpeg     the review sheet of the folder (copy of data/synth/_review/<folder>.jpeg)
+    main<k>/_main.jpeg the main input
+    main<k>/keep/      the pick (a real file; empty if the main has no pick) = the training target
+    main<k>/drop/      every other candidate: <cell>__<reasons>.jpeg or <cell>__lower_score.jpeg
+```
+
+Folders written by `score_synth.py` are listed in `DIR/_exported_synth.json` and **rewritten on every export**: files moved by hand between `keep/` and `drop/` are lost, so correct a pick in `data/synth/overrides.csv` and export again. Other folders (e.g. made by `select_targets.py`) are never touched, and no target file in `data/synth/` is deleted. With the default `--export-drop link` the `drop/` files are symlinks to `data/synth/`, so the review folders depend on it; use `copy` to make them self-contained.
+
+### Calibration
+
+`--labels` compares the automatic picks with a manual selection of `select_targets.py` (files in `main<k>/keep/` = kept, every other cell dropped; a deleted `main<k>/` or review folder = nothing kept). Only labelled folders are scored, and the VLM is asked about every candidate. Output in `<synth-root>/_calibration/`: `calibration.json` (how many hand-kept / dropped cells each gate rejects, metric quantiles of kept vs dropped cells, agreement overall and per main kind), `cells_labeled.csv`, `mains_labeled.csv`, and with `--fit-weights` `weights.csv` (agreement for a 4 × 4 × 4 grid of the score weights; reported, not applied).
+
+```bash
+python score_synth.py --synth-root data/synth_handpicked --decomp-root generate_source_handpicked \
+    --labels data/selection_handpicked/review --fit-weights
+```
+
+Results on the hand-picked v2.1 data (14 folders, 41 mains, 164 cells of 2 × 2 grids; 40 cells kept by hand, at least one in 36 mains):
+
+| Setting | Mains with a pick | Top-1 match | Pick not kept by hand | False accept | False reject | Accept / reject agreement |
+|---|---|---|---|---|---|---|
+| first gates (`--copy-max 0.80 --dino-copy-max 0.90 --lift-min 0 --min-main 0.5 --min-fusion 0.5`, no main kinds) | 16 / 41 | 11 | 5 | 0 | 20 | 0.51 |
+| current gates, `--no-attr-mains` | 21 / 41 | 10 | 11 | 0 | 15 | 0.63 |
+| **current gates, attribute mains (default)** | **35 / 41** | 16 | 16 | 3 | **4** | **0.83** |
+
+- **Gates.** The first `copy` threshold rejected as many kept as dropped cells (kept `cos_main` up to 0.87, `dino_main` up to 0.92 at 1024 px), and `main_not_top` rejected the attribute mains (10 of its 11 rejected kept cells), which led to the current defaults and the main kinds. `no_effect` and `not_distinct` separate best (kept / dropped cells rejected: 3 / 32 and 0 / 9).
+- **Object mains** (23) are the same in both modes: accept / reject agreement 0.91, 2 false rejects, top-1 match 10 of 21.
+- **Attribute mains** (15): by hand all material, pattern and shape mains were kept (7 / 7), but only 4 of 8 color, scene and style mains; the 3 false accepts are mains rejected by hand that `attr_weak` cannot stop (the presence answers saturate near 1: `attr_weak` rejected 0 kept / 2 dropped cells).
+- **Ranking.** `p_main` and `fusion` are almost binary (0 or 1), so among the passing candidates the score is decided by `dino_main` and `distinct`; top-1 agreement is about 0.5 and `--fit-weights` finds no clearly better weights (best: $w_{struct} = 0$, top-1 0.56). Several cells of one main are often acceptable while only one or two were kept by hand, so a pick outside the hand set is not necessarily wrong; the ranking is kept as it is.
+
+---
+
 ## Training data (`build_dataset.py`, `cache_features.py`)
 
 ### Sample pools
@@ -752,7 +910,7 @@ python select_targets.py --synth-root data/synth --output-dir data/selection
 | Pool | Inputs | Main | Target | Source |
 |---|---|---|---|---|
 | unspecified | `input_*.jpeg` of a decomposition folder | none | the original source image (path from `groups.json` → `image`, else `<stem>.*` in `--source-dir`) | every folder of `--decomp-root` (`data/no_main`), one sample each; `recon.jpeg` is not used |
-| designated | the same inputs | input $k$ | the files in `review/<folder>/main<k>/keep/`, one picked at random per draw | the review folders of `select_targets.py` |
+| designated | the same inputs | input $k$ | the files in `review/<folder>/main<k>/keep/`, one picked at random per draw | the review folders in `data/selection/review/`: `score_synth.py --export-review` (one target per main) or `select_targets.py` (manual) |
 
 - **Input consistency.** The designated targets were synthesized on `generate_source/`, a copy of part of `data/no_main` (main picks of `score_sweep.py`, which are exported to both folders; earlier: `screen_sources.py` + manual review). For every review folder the inputs are compared byte by byte with the folder of the same name in `--decomp-root`; if identical, the `data/no_main` paths are used (both pools share the cached latents), otherwise the inputs of the synthesis are kept and the folder is reported, because a target must come with the inputs it was synthesized from.
 - **Split by source image**, stratified: `--val-frac` (10 %) of the sources that have designated samples and 10 % of the others go to validation, so validation contains both pools.
@@ -1155,6 +1313,14 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 5. **Targets of different mains can look alike** when the inputs of a folder are similar; such input sets do not give useful counterfactual pairs.
 6. **Synthesized targets are Kandinsky images** (1024 px, generated from 768 px inputs) and have a lower quality than the real source images used as targets of unspecified samples. Kandinsky 2.2 is mostly used at 512–768 px; at 1024 px check the overviews for repeated structures, and the far-class $s = 0.4$ cells for blur (the upsampled init image is kept the most there).
 
+### Automatic target selection (`score_synth.py`)
+
+1. **Small calibration set.** The defaults come from 14 folders (41 mains) of 2 × 2 grids synthesized by `synthesize.py`; `synthesize_sweep.py` uses a 3 × 3 × 2 grid, and the hand labels were made while the suggestions of `select_targets.py` were visible.
+2. **Saturated VLM answers.** `p_main`, `fusion` and the presence of attribute mains are almost always 0 or 1: they work as gates but hardly rank the passing candidates (top-1 agreement with the hand selection about 0.5), and `attr_weak` hardly rejects anything.
+3. **Attribute mains of type color, scene and style** were often rejected by hand (4 of 8 kept) and cause the false accepts; material, pattern and shape mains were all kept. Use `--no-attr-mains` for a stricter designated pool, and check these mains in `_review/overview_*.jpeg`.
+4. **Unknown mains** (inputs whose own concept is "none of these") never get a pick, although 2 of 3 had a kept target by hand.
+5. **Cost.** 18 candidates per main (1024 px img2img) plus up to (1 + number of other inputs) VLM passes per candidate; `--seeds 1` halves the generation.
+
 ### Multi-reference fine-tuning (`train_multiref.py`)
 
 1. **Designation shown only on an overfitting subset** (see *Current findings*): with `tid` ($t = 3$) it is learned on one designated folder (3 of 4 mains); generalization is untested. `index` did not learn it, `slot` learned a first-position shortcut, `embed` learned it more slowly.
@@ -1170,7 +1336,7 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 
 ### Multi-reference fine-tuning
 
-1. **Review the designated targets by the *Selection criteria*** (in particular folders with two inputs of one category) before building `data/multiref_v2`.
+1. **Check the automatic picks** of `score_synth.py` (`data/synth/_review/overview_*.jpeg`, in particular color / scene / style mains and folders with two inputs of one category; corrections in `overrides.csv`) before building `data/multiref_v2`.
 2. **Full training run** on the extended data (`data/multiref_v2`: more sources, more designated folders, `--val-frac` ≥ 0.15 so that validation has several designated folders) with `tid`, $t = 3$ and `--designated-sigma logit_normal`; enough designated updates (more steps or a larger designated share than the default schedule), judged by the validation `gap_s0.9` and `gap_acc`. `eval_multiref.py` on the final checkpoint: `bias_ratio` should stay well below 0.2.
 3. **Image-level evaluation**: copy rate, `input_acc` and `target_acc` are in `eval_multiref.py`; still missing: permutation invariance (same main, shuffled inputs), balance without a main (every input used) and collage detection.
 4. **Optional**: $t = 4$, or `tid` combined with $E_{main}$, if the high-noise gap stays weak in the full run.
@@ -1182,7 +1348,7 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 3. **Several subjects**: handle the top nouns with a sufficient margin, each kept in one input.
 4. **Seed stability** as a filter: decode with 2–3 seeds and keep inputs whose content is stable.
 5. **Calibrate `score_sweep.py`** against hand labels (no-main / main / reject per folder) on a first batch of the sweep, and decide whether the score should be normalized by the number of inputs.
-6. **Calibrate the suggestions of `select_targets.py`** against the manual selection (cells moved between `keep/` and `drop/`) on 1024 px targets, and add a structural metric such as DINO to tell shape-preserving cells apart.
+6. **Automatic target selection** (`score_synth.py`): recalibrate on hand labels of `synthesize_sweep.py` candidates (3 × 3 × 2 grid); optionally admit only some attribute types (e.g. material, pattern, shape); replace the saturated VLM probabilities by logit differences if the ranking should follow the hand selection more closely.
 
 ### Fixed-K baseline (earlier plan)
 

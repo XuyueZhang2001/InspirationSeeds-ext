@@ -1,8 +1,13 @@
 """
 score_synth.py -- automatic choice of ONE designated-subject target per main, and calibration
 against hand labels.
-Last modified: 2026-11-24 (main kinds: object mains only by default, attribute mains optional with
-               a presence check; defaults from the calibration on the hand-picked v2.1 data:
+Last modified: 2026-11-24 (--gpus: the measurements and VLM answers of the folders are computed in
+               parallel, one process per GPU, then one pass selects / reviews / exports from the caches;
+               --shard, --cache-only; CLIP / DINOv2 loaded only when something is not cached)
+               2026-11-24 (export in the full select_targets.py layout: _inputs.jpeg, _overview.jpeg,
+               drop/ with the other candidates, --export-drop)
+               2026-11-24 (attribute mains admitted by default, --no-attr-mains = object mains only)
+               2026-11-24 (main kinds: object mains, attribute mains with a presence check; defaults from the calibration on the hand-picked v2.1 data:
                --copy-max 0.88 --dino-copy-max 0.94 --lift-min -0.03 --min-main 0 --min-fusion 0)
 
 Selection step of the automatic target selection; replaces the manual choice in select_targets.py.
@@ -32,21 +37,23 @@ Main kinds (from the own concept of the main input)
     object     own concept of type "object"
     attribute  own concept of another type (material, color, shape, pattern, style, scene)
     unknown    no own concept ("none of these")
-By default only object mains can get a pick. --attr-mains also admits attribute mains whose
-concept is clearly present in the target (p_main >= --min-attr).
+By default object mains and attribute mains whose concept is clearly present in the target
+(p_main >= --min-attr) can get a pick; --no-attr-mains restricts the picks to object mains.
+(Calibration on the hand-picked v2.1 data: attribute mains reduced the false rejects from 15 to 4
+of 41 mains at the cost of 3 false accepts.)
 
 Gates (a cell is a candidate only if it passes all)
     copy           cos_main > --copy-max or dino_main > --dino-copy-max    near copy of the main input
     no_effect      lift < --lift-min                                       designation had no effect
     main_unknown   the main input itself has no own concept ("none of these")
-    attr_main      attribute main without --attr-mains (not considered)
+    attr_main      attribute main with --no-attr-mains (not considered)
     main_not_top   object main: the own concept of input k is not the most likely main subject of T
     main_weak      object main: p_main < --min-main (off by default: same cells as main_not_top)
     attr_weak      attribute main: p_main < --min-attr (presence of the main concept)
     no_fusion      max presence of the other inputs' concepts < --min-fusion (off by default)
     not_distinct   distinct < --distinct-min, see below
 The VLM is asked only about cells that pass copy / no_effect (all cells with --vlm-all or --labels),
-and never about attribute mains without --attr-mains.
+and never about attribute mains with --no-attr-mains.
 
 Score and pick
     score    = p_main + w_struct * dino_main + w_fuse * fusion + w_dist * distinct
@@ -64,10 +71,15 @@ Output
                                                failed (red, with the reasons)
     <synth-root>/_review/overview_XX.jpeg      one row per main: main input, pick, recon, inputs
     <synth-root>/_review/cells.csv, picks.csv, summary.json
-    --export-review DIR (e.g. data/selection/review): select_targets.py-style review folders with the
-        pick in main<k>/keep/, read by build_dataset.py unchanged. Folders written by this script are
-        listed in DIR/_exported_synth.json and rewritten on every export; other folders (e.g. made
-        by select_targets.py) are never touched. Target files in the synth folders are never deleted.
+    --export-review DIR (e.g. data/selection/review): review folders in the layout of
+        select_targets.py, read by build_dataset.py unchanged:
+            <folder>/info.json, _inputs.jpeg, _overview.jpeg (the review sheet of the folder)
+            <folder>/main<k>/_main.jpeg, keep/<pick>.jpeg (empty if no pick),
+                             drop/<cell>__<reasons>.jpeg or <cell>__lower_score.jpeg (--export-drop)
+        Folders written by this script are listed in DIR/_exported_synth.json and rewritten on every
+        export, so files moved by hand between keep/ and drop/ are lost: correct picks in
+        <synth-root>/overrides.csv instead. Other folders (e.g. made by select_targets.py) are never
+        touched. Target files in the synth folders are never deleted.
 
 Calibration (--labels)
 ----------------------
@@ -93,10 +105,20 @@ Usage
     python score_synth.py --synth-root data/synth_handpicked --decomp-root generate_source_handpicked \\
         --labels data/selection_handpicked/review --fit-weights
 
-    # also attribute mains (color / pattern / ...), if their concept is clearly present in the target
-    python score_synth.py --synth-root data/synth --attr-mains --min-attr 0.8
+    # object mains only (attribute mains such as color / pattern are not considered)
+    python score_synth.py --synth-root data/synth --no-attr-mains
 
 All measurements and VLM answers are cached: changing a threshold or weight takes seconds.
+
+Several GPUs
+------------
+    python score_synth.py --synth-root data/synth --gpus 0-7
+--gpus 2,3 (or 0-7) starts one process per listed GPU with --shard i/n --cache-only: each computes the
+CLIP / DINOv2 measurements and VLM answers of its part of the folders (round-robin) and writes them to
+the cache files of these folders; logs in <synth-root>/_logs/score_shard_<i>of<n>.log. When all are
+done, this process runs the normal pass on the first listed GPU: everything is cached, so it only
+selects, draws the review, calibrates / exports if asked (and computes what a failed shard left out).
+--gpus 3 runs everything in one process on GPU 3. --shard i/n --cache-only can also be started by hand.
 
 Decomposition folders: synth_meta.json stores the path used at synthesis time. With --decomp-root,
 the folder of the same name under these roots is used FIRST (needed when the original folder was
@@ -108,8 +130,11 @@ import argparse
 import csv
 import itertools
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -145,7 +170,15 @@ def parse_args():
     p.add_argument("--labels", type=Path, default=None, help="Hand-picked review folders (select_targets.py)")
     p.add_argument("--fit-weights", action="store_true", help="With --labels: grid search of the score weights")
     p.add_argument("--export-review", type=Path, default=None, help="Write review folders with the picks here")
+    p.add_argument("--export-drop", choices=("link", "copy", "none"), default="link",
+                   help="Other candidates in main<k>/drop/: symlinks (default, no extra disk space), copies, or none")
     p.add_argument("--limit", type=int, default=None, help="Only the first LIMIT synth folders")
+    p.add_argument("--gpus", default=None,
+                   help="GPUs: '3' = everything on GPU 3; '2,3' or '0-7' = measurements and VLM answers in one "
+                        "process per GPU, then selection / review / export here (default: the default GPU)")
+    p.add_argument("--shard", default=None, help="i/n: only the i-th of n parts of the folders (0-based)")
+    p.add_argument("--cache-only", action="store_true",
+                   help="Only compute and cache measurements and VLM answers (no selection, review or export)")
     # VLM and encoders
     p.add_argument("--no-vlm", action="store_true", help="CLIP / DINOv2 only")
     p.add_argument("--vlm-all", action="store_true", help="Ask the VLM about every cell, also those failing copy / "
@@ -167,11 +200,11 @@ def parse_args():
     p.add_argument("--min-fusion", type=float, default=0.0,
                    help="no_fusion if every other concept has presence < this (0 = off)")
     p.add_argument("--distinct-min", type=float, default=0.0, help="not_distinct if distinct < this")
-    p.add_argument("--attr-mains", action="store_true",
-                   help="Also admit attribute mains (color, pattern, material, shape, style, scene); "
-                        "default: object mains only")
+    p.add_argument("--attr-mains", action=argparse.BooleanOptionalAction, default=True,
+                   help="Admit attribute mains (color, pattern, material, shape, style, scene) besides object "
+                        "mains (default); --no-attr-mains: object mains only")
     p.add_argument("--min-attr", type=float, default=0.8,
-                   help="With --attr-mains: attr_weak if the presence of the main concept in the target < this")
+                   help="Attribute mains: attr_weak if the presence of the main concept in the target < this")
     # score weights
     p.add_argument("--w-struct", type=float, default=1.0, help="Weight of dino_main")
     p.add_argument("--w-fuse", type=float, default=1.0, help="Weight of fusion")
@@ -271,7 +304,7 @@ def encode_paths(enc: Encoders, paths, bs: int):
     return torch.cat(cs), torch.cat(ds)
 
 
-def measure_rec(rec, enc: Encoders, args) -> int:
+def measure_rec(rec, get_enc, args) -> int:
     """Attach clip / dino similarities to every cell; returns the number of newly encoded cells."""
     path = Path(rec["synth_dir"]) / "target_measure.json"
     fresh = lambda d: (not args.remeasure and d.get("version") == MEASURE_VERSION
@@ -283,6 +316,7 @@ def measure_rec(rec, enc: Encoders, args) -> int:
     missing = [c for c in cells if c["file"] not in cache["cells"]]
     r4 = lambda t: np.round(t.cpu().numpy(), 4).tolist()
     if missing or cache["ref"] is None:
+        enc = get_enc()  # loaded on first use only
         ci, di = encode_paths(enc, rec["inputs"], args.batch_size)
         ref = {"clip_pair": r4(ci @ ci.T), "dino_pair": r4(di @ di.T)}
         cr = dr = None
@@ -724,42 +758,68 @@ def settings_dict(args) -> dict:
 # --------------------------------------------------------------------------------------
 # export: review folders for build_dataset.py
 # --------------------------------------------------------------------------------------
-def export_review(recs, dst: Path):
+def place_file(src: str, dst: Path, mode: str):
+    """Copy src to dst, or symlink it (absolute target) with mode "link"."""
+    if mode == "link":
+        dst.symlink_to(Path(src).resolve())
+    else:
+        shutil.copy2(src, dst)
+
+
+def export_review(recs, dst: Path, args):
+    """Review folders in the layout of select_targets.py, read by build_dataset.py unchanged.
+
+        <dst>/<folder>/info.json          decomposition folder, inputs, every cell, the picks
+        <dst>/<folder>/_inputs.jpeg       all inputs of the folder
+        <dst>/<folder>/_overview.jpeg     the review sheet of this folder (copy of _review/<folder>.jpeg)
+        <dst>/<folder>/main<k>/_main.jpeg the main input
+        <dst>/<folder>/main<k>/keep/      the pick (empty if the main has none) -> the training target
+        <dst>/<folder>/main<k>/drop/      every other candidate, <cell>__<reasons>.jpeg (--export-drop)
+    """
     dst.mkdir(parents=True, exist_ok=True)
     manifest_path = dst / EXPORT_MANIFEST
     manifest = set(json.loads(manifest_path.read_text())) if manifest_path.exists() else set()
-    written = removed = skipped = 0
+    written = skipped = n_keep = n_drop = 0
     for rec in recs:
         d = dst / rec["name"]
-        picked = {k: m for k, m in rec["mains"].items() if m["pick"]}
         if d.exists() and rec["name"] not in manifest:
             print(f"[export] {d} exists and was not written by this script: left unchanged")
             skipped += 1
             continue
         if d.exists():
             shutil.rmtree(d)
-        if not picked:
-            if rec["name"] in manifest:
-                manifest.discard(rec["name"])
-                removed += 1
-            continue
         d.mkdir(parents=True)
         info = {"decomposition_folder": rec["folder"], "synth_dir": rec["synth_dir"], "inputs": rec["inputs"],
                 "cells": {f"main{k}": {c["name"]: c["path"] for c in m["cells"]} for k, m in rec["mains"].items()},
                 "picked_by": "score_synth.py",
-                "picks": {f"main{k}": m["pick"] for k, m in rec["mains"].items()}}
+                "picks": {f"main{k}": m["pick"] for k, m in rec["mains"].items()},
+                "kinds": {f"main{k}": m.get("kind") for k, m in rec["mains"].items()},
+                "settings": settings_dict(args)}
         (d / "info.json").write_text(json.dumps(info, indent=2))
-        for k, m in picked.items():
-            keep = d / f"main{k}" / "keep"
-            keep.mkdir(parents=True)
-            shutil.copy2(rec["inputs"][k], d / f"main{k}" / "_main.jpeg")
-            c = next(c for c in m["cells"] if c["name"] == m["pick"])
-            shutil.copy2(c["path"], keep / f"{c['name']}.jpeg")
+        draw_rows([[(p, [(f"input_{i}", BLACK)], None) for i, p in enumerate(rec["inputs"])]],
+                  d / "_inputs.jpeg", 256, n_lines=1)
+        sheet = args.synth_root / "_review" / f"{rec['name']}.jpeg"
+        if sheet.exists():
+            shutil.copy2(sheet, d / "_overview.jpeg")
+        for k, m in rec["mains"].items():
+            main_dir = d / f"main{k}"
+            (main_dir / "keep").mkdir(parents=True)
+            shutil.copy2(rec["inputs"][k], main_dir / "_main.jpeg")
+            if args.export_drop != "none":
+                (main_dir / "drop").mkdir()
+            for c in m["cells"]:
+                if c["name"] == m["pick"]:
+                    shutil.copy2(c["path"], main_dir / "keep" / f"{c['name']}.jpeg")  # the target: always a real file
+                    n_keep += 1
+                elif args.export_drop != "none":
+                    reason = "_".join(c["reasons"]) if c["reasons"] else "lower_score"
+                    place_file(c["path"], main_dir / "drop" / f"{c['name']}__{reason}.jpeg", args.export_drop)
+                    n_drop += 1
         manifest.add(rec["name"])
         written += 1
     manifest_path.write_text(json.dumps(sorted(manifest), indent=1))
-    print(f"export -> {dst}: {written} review folder(s) written, {removed} removed (no pick any more), "
-          f"{skipped} left unchanged (not ours)")
+    print(f"export -> {dst}: {written} review folder(s) written ({n_keep} picks in keep/, {n_drop} candidates in "
+          f"drop/{' as symlinks' if args.export_drop == 'link' else ''}), {skipped} left unchanged (not ours)")
 
 
 # --------------------------------------------------------------------------------------
@@ -932,8 +992,86 @@ def calibrate(recs, labels, args, weights):
 
 
 # --------------------------------------------------------------------------------------
+def parse_gpus(text: str):
+    """'3' -> [3]; '2,3' -> [2, 3]; '0-7' -> [0, ..., 7]; '0,2-3' -> [0, 2, 3]."""
+    gpus = []
+    for part in (x.strip() for x in text.split(",")):
+        if "-" in part:
+            a, b = part.split("-")
+            gpus.extend(range(int(a), int(b) + 1))
+        elif part:
+            gpus.append(int(part))
+    if not gpus or len(set(gpus)) != len(gpus):
+        raise ValueError(f"--gpus {text!r}: give distinct GPU indices, e.g. 3, 2,3 or 0-7")
+    return gpus
+
+
+def parse_shard(text: str):
+    """'1/4' -> (1, 4): the second of four parts (0-based)."""
+    i, n = (int(x) for x in text.split("/"))
+    if not (n >= 1 and 0 <= i < n):
+        raise ValueError(f"--shard {text!r}: expected i/n with 0 <= i < n")
+    return i, n
+
+
+def strip_options(argv, names):
+    """Remove the given options (and their values) from an argument list."""
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a in names:
+            skip = True
+        elif not any(a.startswith(name + "=") for name in names):
+            out.append(a)
+    return out
+
+
+def launch_cache_shards(args, gpus) -> bool:
+    """One --cache-only child per GPU on its part of the folders; returns True if all succeeded."""
+    n = len(gpus)
+    logs = args.synth_root / "_logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    base = strip_options(sys.argv[1:], ("--gpus", "--shard"))
+    procs = []
+    for i, g in enumerate(gpus):
+        cmd = [sys.executable, os.path.abspath(__file__)] + base + ["--shard", f"{i}/{n}", "--cache-only"]
+        log_path = logs / f"score_shard_{i}of{n}.log"
+        log = open(log_path, "w")
+        proc = subprocess.Popen(cmd, env=dict(os.environ, CUDA_VISIBLE_DEVICES=str(g)), stdout=log,
+                                stderr=subprocess.STDOUT)
+        procs.append((i, g, proc, log, log_path))
+        print(f"cache shard {i}/{n} on GPU {g}: log {log_path}")
+    print("waiting for all shards (follow a log with: tail -f <log>)")
+    t0, ok = time.time(), True
+    for i, g, proc, log, log_path in procs:
+        code = proc.wait()
+        log.close()
+        print(f"cache shard {i}/{n} on GPU {g} finished with exit code {code} after {time.time() - t0:.0f} s")
+        if code != 0:
+            ok = False
+            print(f"[warn] see {log_path}; the final pass computes what this shard left out")
+    return ok
+
+
 def main():
     args = parse_args()
+    shard = parse_shard(args.shard) if args.shard else None
+    if args.gpus is not None:
+        gpus = parse_gpus(args.gpus)
+        if len(gpus) > 1:
+            if shard is not None or args.cache_only:
+                raise ValueError("--gpus with several GPUs starts its own shards: do not combine it with "
+                                 "--shard or --cache-only")
+            launch_cache_shards(args, gpus)
+            args.remeasure = args.reask = False  # the caches were just (re)computed by the shards
+        # this process (selection / review / export, leftovers) runs on the first listed GPU;
+        # set before CUDA is initialized
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[0])
+    run(args, shard)
+
+
+def run(args, shard):
     t0, counts = time.time(), Counter()
     metas = sorted(p for p in args.synth_root.rglob("synth_meta.json")
                    if not any(part.startswith("_") for part in p.relative_to(args.synth_root).parts))
@@ -947,20 +1085,32 @@ def main():
             continue  # calibration: only labelled folders
         recs.append(rec)
     recs = recs[: args.limit]
+    if shard is not None:
+        recs = recs[shard[0]::shard[1]]  # round-robin split, stable because the metas are sorted
     if not recs:
-        raise SystemExit(f"no usable synth folders under {args.synth_root}" + (" with labels" if labels else ""))
-    print(f"{len(recs)} synth folder(s), {sum(len(r['mains']) for r in recs)} main(s), "
-          f"{sum(len(m['cells']) for r in recs for m in r['mains'].values())} cell(s)")
+        raise SystemExit(f"no usable synth folders under {args.synth_root}" + (" with labels" if labels else "")
+                         + (f" in shard {shard[0]}/{shard[1]}" if shard else ""))
+    print(f"{len(recs)} synth folder(s){f' (shard {shard[0]}/{shard[1]})' if shard else ''}, "
+          f"{sum(len(r['mains']) for r in recs)} main(s), "
+          f"{sum(len(m['cells']) for r in recs for m in r['mains'].values())} cell(s); "
+          f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
 
-    # CLIP / DINOv2
-    enc = Encoders(args.dino_model, args.device)
+    # CLIP / DINOv2 (loaded only if something is not cached)
+    enc = None
+
+    def get_enc():
+        nonlocal enc
+        enc = enc or Encoders(args.dino_model, args.device)
+        return enc
+
     for rec in tqdm(recs, desc="CLIP / DINOv2"):
-        counts["cells encoded"] += measure_rec(rec, enc, args)
+        counts["cells encoded"] += measure_rec(rec, get_enc, args)
         cheap_fields(rec, args)
-    del enc
-    torch.cuda.empty_cache()
+    if enc is not None:
+        del enc
+        torch.cuda.empty_cache()
 
-    # VLM
+    # VLM (loaded only if something is not cached)
     vlm = None
 
     def get_vlm():
@@ -971,6 +1121,10 @@ def main():
     if not args.no_vlm:
         for rec in tqdm(recs, desc="VLM"):
             vlm_rec(rec, get_vlm, args, counts)
+    if args.cache_only:
+        print(f"\ncached in {time.time() - t0:.0f} s; new work: "
+              + (", ".join(f"{k} {v}" for k, v in counts.items() if v) or "none (all cached)"))
+        return
     for rec in recs:
         gate_fields(rec, args)
 
@@ -982,7 +1136,7 @@ def main():
         select_rec(rec, weights, args, overrides)
     summary = write_review(recs, args)
     if args.export_review:
-        export_review(recs, args.export_review)
+        export_review(recs, args.export_review, args)
 
     print(f"\nscored in {time.time() - t0:.0f} s; new work: "
           + (", ".join(f"{k} {v}" for k, v in counts.items() if v) or "none (all cached)"))
