@@ -1013,6 +1013,20 @@ Batch 1, `--grad-accum` samples per optimizer step; as in the diffusers example 
 - **Checkpoints** every `--save-every` steps: `checkpoint-XXXXXX/lora/` (diffusers LoRA format), `role_embedding.safetensors` (only with `--role embed`), `train_state.pt` (resume with `--resume`). `args.json` in the run folder records all settings (read by `eval_multiref.py`).
 - **Log** `log.jsonl` (optionally TensorBoard): loss per pool, gradient norm, pool probability `p_unspec`, share of designated samples, mean $\sigma$ per pool (`sigma_designated`, `sigma_unspecified`), learning rate, time per step, the validation losses and the gap values; with `--role embed` also `e_main_norm`, `ref_token_norm` and `e_main_ratio`. Training-loss lines are dominated by the random $\sigma$ and pool of each sample; trends show in the validation loss and the gap.
 
+### Several GPUs
+
+Data parallel: every GPU holds the full model and draws its own samples (own sampler, input order, $\sigma$ and noise), and after the `--grad-accum` micro steps of an optimizer step the gradients of the trainable parameters (LoRA, $E_{main}$) are averaged over the GPUs (one all-reduce), so every GPU makes the same update. Validation, the designation gap, sample images, checkpoints and the log are made by the first GPU; the others wait.
+
+```bash
+python train_multiref.py --gpus 0,1,2,3 --data-dir data/multiref --output-dir runs/v2 --grad-accum 1 ...
+# equivalent
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 train_multiref.py --grad-accum 1 ...
+```
+
+- **Samples per optimizer step** = `--grad-accum` × number of GPUs (printed at the start, `world_size` in `args.json`). 4 GPUs with `--grad-accum 1` give the 4 samples per step of a single-GPU run with `--grad-accum 4` in about a quarter of the time; keeping `--grad-accum 4` on 4 GPUs gives 16 samples per step (fewer, larger steps: adjust `--max-steps` / `--lr`).
+- **Resume** with the same number of GPUs restores every GPU's random state; with another number the states are reseeded from the step (a warning is printed).
+- Checkpoints are in the same format as single-GPU runs (`eval_multiref.py`, `generate_multi.py` unchanged).
+
 ### Overfitting test
 
 `--overfit N` trains on about N fixed training samples: whole designated folders with all their mains (counterfactual pairs) up to about N / 2 samples, one target per main, filled up with unspecified samples (first those of the same folders). The same samples are used for validation and the gap, and the pools are drawn 50 : 50 unless `--unspec-schedule` is given.
@@ -1118,6 +1132,7 @@ Output (default `<checkpoint>/eval/`): `summary.json` (overall and per $\sigma$,
 | `--gap-every`, `--gap-samples`, `--gap-sigmas`, `--gap-noises` | = `--val-every`, 8, `0.9,0.75,0.5,0.25`, 1 | Designation gap (0 = off) |
 | `--image-every`, `--image-folders`, `--image-steps`, `--no-images-at-start` | 1000, 3, 28, off | Sample images |
 | `--save-every`, `--resume`, `--tensorboard` | 1000, none, off | Checkpoints and logging |
+| `--gpus` | – | `3`: train on GPU 3; `0,1,2,3` / `0-3`: data parallel on these GPUs (restarts itself with `torchrun`); see *Several GPUs* |
 
 ---
 

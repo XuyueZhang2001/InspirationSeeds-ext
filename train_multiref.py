@@ -1,6 +1,8 @@
 """
 train_multiref.py -- LoRA (+ main-image role embedding) fine-tuning of FLUX.1 Kontext dev with 2-4 references.
-Last modified: 2026-11-22 (--overfit-folders: overfitting test on named folders; default --main-t 2 -> 3)
+Last modified: 2026-11-25 (several GPUs: data parallel with torchrun or --gpus; gradients of the trainable
+               parameters averaged over the GPUs after every optimizer step)
+               2026-11-22 (--overfit-folders: overfitting test on named folders; default --main-t 2 -> 3)
                2026-11-20 (default --role embed -> tid)
                2026-11-19 (role mode "tid": main image marked by position id t = --main-t)
 
@@ -108,16 +110,34 @@ Usage
 
     # full run
     python train_multiref.py --data-dir data/multiref --output-dir runs/v1 --max-steps 10000
+
+Several GPUs (data parallel)
+    python train_multiref.py --gpus 0,1,2,3 ...            # restarts itself with torchrun on GPUs 0-3
+    CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 train_multiref.py ...
+    Every GPU holds the full model and draws its own samples (own sampler, order, sigma and noise
+    seeds); after the --grad-accum micro steps of an optimizer step the gradients of the trainable
+    parameters (LoRA, E_main) are averaged over the GPUs, so every GPU makes the same update and the
+    parameters stay identical. Samples per optimizer step = --grad-accum x number of GPUs: with
+    4 GPUs, --grad-accum 1 gives the 4 samples per step of a single-GPU run with --grad-accum 4,
+    about 4 times faster. Validation, designation gap, sample images, checkpoints and the log are
+    made by the first GPU only; the others wait. Resuming needs the same number of GPUs to restore
+    the per-GPU random states exactly (otherwise they are reseeded from the step).
 """
 
 import argparse
+import builtins
 import json
+import os
 import random
+import subprocess
+import sys
 import time
 from collections import defaultdict
+from datetime import timedelta
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, FluxKontextPipeline, FluxTransformer2DModel
 from diffusers.training_utils import (
     cast_training_params,
@@ -149,8 +169,9 @@ from multiref.train_data import (
     pick_overfit_rows,
 )
 
-DEVICE = "cuda"
+DEVICE = "cuda"  # with several GPUs: the GPU of this process (torch.cuda.set_device in setup_distributed)
 DTYPE = torch.bfloat16
+RANK, WORLD = 0, 1  # set by setup_distributed
 DEFAULT_SCHEDULE = "0:1.0,0.3:1.0,0.4:0.65"
 OVERFIT_SCHEDULE = "0.5"
 # LoRA layers (suffixes of module names inside transformer_blocks / single_transformer_blocks)
@@ -231,10 +252,138 @@ def parse_args():
     g.add_argument("--save-every", type=int, default=1000)
     g.add_argument("--resume", type=Path, default=None, help="checkpoint-XXXXXX folder to resume from")
     g.add_argument("--tensorboard", action="store_true", help="Also log to TensorBoard (<output-dir>/tb)")
+
+    g = p.add_argument_group("GPUs")
+    g.add_argument("--gpus", default=None,
+                   help="GPUs to train on: '3' = GPU 3; '0,1,2,3' or '0-3' = data parallel on these GPUs "
+                        "(the script restarts itself with torchrun). Default: one process on the default GPU, "
+                        "or as started by torchrun")
     args = p.parse_args()
     if args.gap_every is None:
         args.gap_every = args.val_every
     return args
+
+
+# --------------------------------------------------------------------------------------
+# Several GPUs
+# --------------------------------------------------------------------------------------
+def parse_gpus(text: str):
+    """'3' -> [3]; '0,1' -> [0, 1]; '0-3' -> [0, 1, 2, 3]; '0,2-3' -> [0, 2, 3]."""
+    gpus = []
+    for part in (x.strip() for x in text.split(",")):
+        if "-" in part:
+            a, b = part.split("-")
+            gpus.extend(range(int(a), int(b) + 1))
+        elif part:
+            gpus.append(int(part))
+    if not gpus or len(set(gpus)) != len(gpus):
+        raise ValueError(f"--gpus {text!r}: give distinct GPU indices, e.g. 3, 0,1 or 0-3")
+    return gpus
+
+
+def strip_option(argv, name):
+    """Remove an option and its value from an argument list."""
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a == name:
+            skip = True
+        elif not a.startswith(name + "="):
+            out.append(a)
+    return out
+
+
+def launch_with_gpus(args):
+    """Handle --gpus before anything touches CUDA. Returns True if this process should continue."""
+    if args.gpus is None or "LOCAL_RANK" in os.environ:
+        return True
+    gpus = parse_gpus(args.gpus)
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpus)
+    if len(gpus) == 1:
+        return True  # one GPU: this process
+    cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={len(gpus)}",
+           os.path.abspath(__file__)] + strip_option(sys.argv[1:], "--gpus")
+    print(f"data parallel on GPUs {gpus}: {' '.join(cmd)}")
+    sys.exit(subprocess.run(cmd, env=os.environ.copy()).returncode)
+
+
+def setup_distributed():
+    """Initialize torch.distributed when started by torchrun; only the first process prints."""
+    global RANK, WORLD
+    if "LOCAL_RANK" not in os.environ:
+        return
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)  # DEVICE = "cuda" now means this GPU
+    # long timeout: the other processes wait while the first one validates or draws sample images
+    dist.init_process_group("nccl", timeout=timedelta(hours=2), device_id=torch.device("cuda", local_rank))
+    RANK, WORLD = dist.get_rank(), dist.get_world_size()
+    if RANK != 0:
+        builtins.print = lambda *a, **k: None
+
+
+def barrier():
+    if WORLD > 1:
+        dist.barrier()
+
+
+@torch.no_grad()
+def average_gradients(params):
+    """Average the gradients of the trainable parameters over the GPUs (one all-reduce per dtype)."""
+    if WORLD == 1:
+        return
+    by_dtype = defaultdict(list)
+    for p in params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+        by_dtype[p.grad.dtype].append(p)
+    for group in by_dtype.values():
+        flat = torch.cat([p.grad.reshape(-1) for p in group])
+        dist.all_reduce(flat)
+        flat /= WORLD
+        offset = 0
+        for p in group:
+            n = p.grad.numel()
+            p.grad.copy_(flat[offset:offset + n].view_as(p.grad))
+            offset += n
+
+
+@torch.no_grad()
+def broadcast_parameters(params):
+    """Copy the parameters of the first GPU to the others (same start, guard against drift)."""
+    if WORLD == 1:
+        return
+    for p in params:
+        dist.broadcast(p.data, src=0)
+
+
+def gather_window(window):
+    """Merge the logging windows of all GPUs (every GPU must call this)."""
+    if WORLD == 1:
+        return window
+    parts = [None] * WORLD
+    dist.all_gather_object(parts, dict(window))
+    merged = defaultdict(list)
+    for part in parts:
+        for k, v in part.items():
+            merged[k].extend(v)
+    return merged
+
+
+def rng_state(sampler, data_rng, sigma_gen):
+    return {"sampler_rng": sampler.rng.getstate(), "data_rng": data_rng.getstate(),
+            "sigma_gen": sigma_gen.get_state(), "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state()}
+
+
+def gather_rng_states(sampler, data_rng, sigma_gen):
+    """Random states of every GPU, in rank order (every GPU must call this)."""
+    state = rng_state(sampler, data_rng, sigma_gen)
+    if WORLD == 1:
+        return [state]
+    parts = [None] * WORLD
+    dist.all_gather_object(parts, state)
+    return parts
 
 
 # --------------------------------------------------------------------------------------
@@ -521,7 +670,7 @@ def save_sample_grid(blocks, path, step, tile=256):
 # --------------------------------------------------------------------------------------
 # Checkpoints
 # --------------------------------------------------------------------------------------
-def save_checkpoint(out_dir: Path, transformer, role, optimizer, lr_sched, step, sampler, data_rng, args):
+def save_checkpoint(out_dir: Path, transformer, role, optimizer, lr_sched, step, rank_states, args):
     out_dir.mkdir(parents=True, exist_ok=True)
     lora_state = get_peft_model_state_dict(transformer)
     FluxKontextPipeline.save_lora_weights(
@@ -537,16 +686,15 @@ def save_checkpoint(out_dir: Path, transformer, role, optimizer, lr_sched, step,
         "e_main": role.e_main.detach().cpu() if role is not None else None,
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_sched.state_dict(),
-        "sampler_rng": sampler.rng.getstate(),
-        "data_rng": data_rng.getstate(),
-        "torch_rng": torch.get_rng_state(),
-        "cuda_rng": torch.cuda.get_rng_state(),
+        **rank_states[0],                  # random states of the first GPU (single-GPU format)
+        "rank_states": rank_states,        # random states of every GPU
+        "world_size": len(rank_states),
         "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
     }, out_dir / "train_state.pt")
     print(f"saved {out_dir}")
 
 
-def load_checkpoint(path: Path, transformer, role, optimizer, lr_sched, sampler, data_rng):
+def load_checkpoint(path: Path, transformer, role, optimizer, lr_sched, sampler, data_rng, sigma_gen, args):
     state = torch.load(path / "train_state.pt", map_location="cpu", weights_only=False)
     set_peft_model_state_dict(transformer, state["lora"], adapter_name="default")
     cast_training_params(transformer, dtype=torch.float32)
@@ -555,10 +703,23 @@ def load_checkpoint(path: Path, transformer, role, optimizer, lr_sched, sampler,
             role.e_main.copy_(state["e_main"].to(role.e_main.device))
     optimizer.load_state_dict(state["optimizer"])
     lr_sched.load_state_dict(state["lr_scheduler"])
-    sampler.rng.setstate(state["sampler_rng"])
-    data_rng.setstate(state["data_rng"])
-    torch.set_rng_state(state["torch_rng"])
-    torch.cuda.set_rng_state(state["cuda_rng"])
+    states = state.get("rank_states") or [{k: state[k] for k in ("sampler_rng", "data_rng", "torch_rng", "cuda_rng")}]
+    if len(states) == WORLD:
+        st = states[RANK]
+        sampler.rng.setstate(st["sampler_rng"])
+        data_rng.setstate(st["data_rng"])
+        if "sigma_gen" in st:
+            sigma_gen.set_state(st["sigma_gen"])
+        torch.set_rng_state(st["torch_rng"])
+        torch.cuda.set_rng_state(st["cuda_rng"])
+    else:
+        # other number of GPUs: new, distinct random states per GPU, derived from the step
+        seed = args.seed + 7919 * state["step"] + 1000 * RANK
+        sampler.rng.seed(seed + 2)
+        data_rng.seed(seed + 1)
+        sigma_gen.manual_seed(seed + 3)
+        torch.manual_seed(seed)
+        print(f"[warn] checkpoint saved with {len(states)} GPU(s), resuming on {WORLD}: random states reseeded")
     print(f"resumed from {path} at step {state['step']}")
     return state["step"]
 
@@ -566,7 +727,10 @@ def load_checkpoint(path: Path, transformer, role, optimizer, lr_sched, sampler,
 # --------------------------------------------------------------------------------------
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
+    launch_with_gpus(args)   # --gpus with several GPUs: restarts with torchrun and exits here
+    setup_distributed()
+    args.world_size = WORLD
+    torch.manual_seed(args.seed)  # same seed on every GPU: identical LoRA initialization
     args.output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = args.cache_dir or args.data_dir / "cache"
 
@@ -598,10 +762,12 @@ def main():
             continue
         store.prompt(prompt_key(main_pos, args.role))  # fail early if a template is missing
 
-    sampler = PoolSampler(train_rows, seed=args.seed + 2)
-    data_rng = random.Random(args.seed + 1)
+    # every GPU draws its own samples, orders, sigmas and noise (offset 1000 * rank; rank 0 = single GPU)
+    sampler = PoolSampler(train_rows, seed=args.seed + 2 + 1000 * RANK)
+    data_rng = random.Random(args.seed + 1 + 1000 * RANK)
     print(f"train: {len(train_rows)} samples {sampler.counts()}; val: {len(val_rows)} samples; "
           f"unspecified-pool schedule {schedule.spec!r}")
+    print(f"GPUs: {WORLD}; samples per optimizer step: {args.grad_accum} x {WORLD} = {args.grad_accum * WORLD}")
 
     # ---------------- model ----------------
     transformer = build_transformer(args)
@@ -609,7 +775,7 @@ def main():
     if args.role == "embed":
         role = MainRoleEmbedding(transformer.inner_dim).to(DEVICE).attach(transformer)
     sigmas = sigma_table(args)
-    sigma_gen = torch.Generator().manual_seed(args.seed + 3)
+    sigma_gen = torch.Generator().manual_seed(args.seed + 3 + 1000 * RANK)
 
     groups = [{"params": [p for p in transformer.parameters() if p.requires_grad],
                "lr": args.lr, "weight_decay": args.weight_decay}]
@@ -618,19 +784,27 @@ def main():
     optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.999), eps=1e-8)
     lr_sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: min(1.0, (s + 1) / max(1, args.warmup_steps)))
     trainable = [p for g in groups for p in g["params"]]
+    broadcast_parameters(trainable)       # identical start on every GPU
+    torch.manual_seed(args.seed + RANK)   # from here on: own noise per GPU (rank 0 = single GPU)
 
     step = 0
     if args.resume:
-        step = load_checkpoint(args.resume, transformer, role, optimizer, lr_sched, sampler, data_rng)
+        step = load_checkpoint(args.resume, transformer, role, optimizer, lr_sched, sampler, data_rng, sigma_gen,
+                               args)
+        broadcast_parameters(trainable)
 
-    # sample-image pipeline: the training transformer + VAE, prompts from the cache
-    vae = AutoencoderKL.from_pretrained(args.base_model, subfolder="vae", torch_dtype=DTYPE).to(DEVICE)
-    pipe = MultiRefKontextPipeline(
-        scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(args.base_model, subfolder="scheduler"),
-        vae=vae, text_encoder=None, tokenizer=None, text_encoder_2=None, tokenizer_2=None, transformer=transformer)
-    pipe.set_progress_bar_config(disable=True)
-    val_set = fixed_val_set(val_rows, store, args) if args.val_every else []
-    gap_set = designation_gap_set(val_rows, store, args) if args.gap_every else []
+    # validation, gap and sample images only on the first GPU
+    main_proc = RANK == 0
+    pipe = None
+    if main_proc and args.image_every:
+        # sample-image pipeline: the training transformer + VAE, prompts from the cache
+        vae = AutoencoderKL.from_pretrained(args.base_model, subfolder="vae", torch_dtype=DTYPE).to(DEVICE)
+        pipe = MultiRefKontextPipeline(
+            scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(args.base_model, subfolder="scheduler"),
+            vae=vae, text_encoder=None, tokenizer=None, text_encoder_2=None, tokenizer_2=None, transformer=transformer)
+        pipe.set_progress_bar_config(disable=True)
+    val_set = fixed_val_set(val_rows, store, args) if (main_proc and args.val_every) else []
+    gap_set = designation_gap_set(val_rows, store, args) if (main_proc and args.gap_every) else []
     if args.gap_every and not gap_set:
         print("[warn] no designated validation samples: designation gap disabled")
     elif gap_set:
@@ -638,17 +812,20 @@ def main():
         n_fwd = n_cond * len(parse_sigmas(args.gap_sigmas)) * args.gap_noises
         print(f"designation gap: {len(gap_set)} samples ({', '.join(item['id'] for item in gap_set)}), "
               f"{n_fwd} forward passes per evaluation")
-    folders = image_folders(val_rows, args.image_folders) if args.image_every else []
+    folders = image_folders(val_rows, args.image_folders) if (main_proc and args.image_every) else []
 
     writer = None
-    if args.tensorboard:
+    if args.tensorboard and main_proc:
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(args.output_dir / "tb")
     log_path = args.output_dir / "log.jsonl"
-    with open(args.output_dir / "args.json", "w") as f:
-        json.dump({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, f, indent=2)
+    if main_proc:
+        with open(args.output_dir / "args.json", "w") as f:
+            json.dump({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, f, indent=2)
 
     def log(record):
+        if not main_proc:
+            return
         with open(log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
         if writer is not None:
@@ -666,6 +843,7 @@ def main():
         rec = {"step": 0, **designation_gap(transformer, role, gap_set, args)}
         log(rec)
         print("step 0 " + " ".join(f"{k} {v:.4f}" for k, v in rec.items() if k != "step"))
+    barrier()  # the other GPUs wait for the step-0 evaluation
 
     # ---------------- training ----------------
     transformer.train()
@@ -683,6 +861,7 @@ def main():
             window["loss"].append(loss.item())
             window[f"loss_{ex['pool']}"].append(loss.item())
             window["designated"].append(float(ex["pool"] == "designated"))
+        average_gradients(trainable)  # same averaged gradient on every GPU -> same update
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
         optimizer.step()
         lr_sched.step()
@@ -691,7 +870,8 @@ def main():
         window["grad_norm"].append(float(grad_norm))
 
         if step % args.log_every == 0 or step == args.max_steps:
-            rec = {"step": step, **{k: sum(v) / len(v) for k, v in window.items() if v},
+            merged = gather_window(window)  # samples of every GPU
+            rec = {"step": step, **{k: sum(v) / len(v) for k, v in merged.items() if v},
                    "p_unspec": p_unspec, "lr": lr_sched.get_last_lr()[0],
                    "sec_per_step": (time.time() - t0) / args.log_every}
             if role is not None:
@@ -705,7 +885,7 @@ def main():
             print(" ".join([f"step {step}"] + [f"{k} {v:.4g}" for k, v in rec.items() if k != "step"]))
             window.clear()
             t0 = time.time()
-        if val_set and step % args.val_every == 0:
+        if val_set and step % args.val_every == 0:  # val_set, gap_set, folders: first GPU only
             rec = {"step": step, **validation_loss(transformer, role, val_set, args)}
             log(rec)
             print(f"step {step} " + " ".join(f"{k} {v:.4f}" for k, v in rec.items() if k != "step"))
@@ -715,13 +895,24 @@ def main():
             print(f"step {step} " + " ".join(f"{k} {v:.4f}" for k, v in rec.items() if k != "step"))
         if folders and step % args.image_every == 0:
             print(f"sample images: {sample_images(pipe, role, folders, store, args, step)}")
-        if step % args.save_every == 0 or step == args.max_steps:
-            save_checkpoint(args.output_dir / f"checkpoint-{step:06d}", transformer, role, optimizer, lr_sched,
-                            step, sampler, data_rng, args)
+        saving = step % args.save_every == 0 or step == args.max_steps
+        if saving:
+            broadcast_parameters(trainable)  # guard against numerical drift between GPUs
+            rank_states = gather_rng_states(sampler, data_rng, sigma_gen)
+            if main_proc:
+                save_checkpoint(args.output_dir / f"checkpoint-{step:06d}", transformer, role, optimizer, lr_sched,
+                                step, rank_states, args)
+        evaluating = ((args.val_every and step % args.val_every == 0)
+                      or (args.gap_every and step % args.gap_every == 0)
+                      or (args.image_every and step % args.image_every == 0))
+        if saving or evaluating:
+            barrier()  # the other GPUs wait for the first one
 
     if writer is not None:
         writer.close()
     print("done")
+    if WORLD > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
