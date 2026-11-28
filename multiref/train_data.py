@@ -13,6 +13,14 @@ Sampling inside a pool
     designated   uniform over folders, then over the mains of the folder, then over the kept
                  targets of the main (every source image counts the same, however many mains
                  and targets it has)
+
+Reference augmentation (2026-11-26)
+    cache_features.py --ref-augs N stores N augmented versions of every input (horizontal flip
+    and / or a random square crop, see there) as <cache-dir>/latents/<key>_aug<v>.pt. With
+    aug_prob > 0, make_example replaces each reference independently with probability aug_prob
+    by one of these versions (uniform over v). The target is never augmented, so copying the
+    main reference pixel by pixel no longer matches the target. aug_on = "main" restricts this
+    to the main reference (comparison only: then "augmented" correlates with "main").
 """
 
 from __future__ import annotations
@@ -24,7 +32,7 @@ from pathlib import Path
 
 import torch
 
-from .data import cache_file, read_jsonl
+from .data import cache_key, cache_file, read_jsonl
 from .prompts import arrange, prompt_key
 
 
@@ -66,8 +74,16 @@ class PoolSchedule:
 # --------------------------------------------------------------------------------------
 # Cache
 # --------------------------------------------------------------------------------------
+def aug_cache_file(cache_dir, path, size: int, aug: int) -> Path:
+    """Cached latent of the augmented version aug (0 .. N-1) of one input image."""
+    return Path(cache_dir) / "latents" / f"{cache_key(path, size)}_aug{int(aug)}.pt"
+
+
 class LatentStore:
-    """Cached VAE latents ([16, h, w], bfloat16) and prompt embeddings, optionally kept in memory."""
+    """Cached VAE latents ([16, h, w], bfloat16) and prompt embeddings, optionally kept in memory.
+
+    ref_augs: number of augmented versions per input in the cache (0 = none; config.json "ref_augs").
+    """
 
     def __init__(self, cache_dir, preload_paths=None):
         self.cache_dir = Path(cache_dir)
@@ -75,26 +91,34 @@ class LatentStore:
             self.config = json.load(f)
         self.ref_size = self.config["ref_size"]
         self.target_size = self.config["target_size"]
+        self.ref_augs = int(self.config.get("ref_augs", 0))
         self.prompts = torch.load(self.cache_dir / "prompts.pt", map_location="cpu")
         self._mem = {}
         if preload_paths:
-            for path, size in preload_paths:
-                self._mem[(str(Path(path).resolve()), size)] = self._load(path, size)
+            for item in preload_paths:
+                path, size, aug = (tuple(item) + (None,))[:3]   # (path, size) or (path, size, aug)
+                self._mem[(str(Path(path).resolve()), size, aug)] = self._load(path, size, aug)
 
-    def _load(self, path, size) -> torch.Tensor:
-        f = cache_file(self.cache_dir, path, size)
+    def _load(self, path, size, aug=None) -> torch.Tensor:
+        if aug is None:
+            f = cache_file(self.cache_dir, path, size)
+        else:
+            f = aug_cache_file(self.cache_dir, path, size, aug)
         if not f.exists():
-            raise FileNotFoundError(f"No cached latent for {path} at {size} px ({f}); run cache_features.py")
+            what = "" if aug is None else f" (augmented version {aug})"
+            raise FileNotFoundError(f"No cached latent for {path} at {size} px{what} ({f}); run cache_features.py"
+                                    + ("" if aug is None else " with --ref-augs"))
         return torch.load(f, map_location="cpu")
 
-    def latent(self, path, size) -> torch.Tensor:
-        key = (str(Path(path).resolve()), size)
+    def latent(self, path, size, aug=None) -> torch.Tensor:
+        key = (str(Path(path).resolve()), size, aug)
         if key in self._mem:
             return self._mem[key]
-        return self._load(path, size)
+        return self._load(path, size, aug)
 
-    def ref(self, path):
-        return self.latent(path, self.ref_size)
+    def ref(self, path, aug=None):
+        """Reference latent; aug = None for the original, else the augmented version aug."""
+        return self.latent(path, self.ref_size, aug)
 
     def target(self, path):
         return self.latent(path, self.target_size)
@@ -105,13 +129,18 @@ class LatentStore:
         return self.prompts[key]
 
 
-def all_latent_paths(rows, store_ref_size, store_target_size):
-    """Every (path, size) needed by the rows (for preloading)."""
+def all_latent_paths(rows, store_ref_size, store_target_size, ref_augs: int = 0):
+    """Every (path, size, aug) needed by the rows (for preloading); aug = None for the originals.
+
+    ref_augs > 0 also lists the augmented versions 0 .. ref_augs-1 of every input.
+    """
     out = set()
     for r in rows:
-        out.update((x, store_ref_size) for x in r["inputs"])
-        out.update((x, store_target_size) for x in r["targets"])
-    return sorted(out)
+        for x in r["inputs"]:
+            out.add((x, store_ref_size, None))
+            out.update((x, store_ref_size, v) for v in range(ref_augs))
+        out.update((x, store_target_size, None) for x in r["targets"])
+    return sorted(out, key=lambda t: (str(t[0]), t[1], -1 if t[2] is None else t[2]))
 
 
 # --------------------------------------------------------------------------------------
@@ -153,13 +182,29 @@ class PoolSampler:
         return row, self.rng.choice(row["targets"])
 
 
-def make_example(row, target_path, store: LatentStore, role_mode: str, rng: random.Random, shuffle: bool = True):
-    """One training example: reference latents in model order, target latent and prompt embeddings."""
+def make_example(row, target_path, store: LatentStore, role_mode: str, rng: random.Random, shuffle: bool = True,
+                 aug_prob: float = 0.0, aug_on: str = "all"):
+    """One training example: reference latents in model order, target latent and prompt embeddings.
+
+    aug_prob > 0: every reference (aug_on "all") or only the main reference (aug_on "main") is
+    replaced with probability aug_prob by a random augmented version from the cache. With
+    aug_prob = 0 no extra random numbers are drawn, so the example is the same as before.
+    "augs" in the result: augmented version per reference in model order (None = original).
+    """
     order, main_pos, _ = arrange(len(row["inputs"]), row["main"], role_mode, shuffle=shuffle, rng=rng)
-    refs = [store.ref(row["inputs"][i]) for i in order]
+    augs = [None] * len(order)
+    if aug_prob > 0:
+        if store.ref_augs <= 0:
+            raise ValueError("aug_prob > 0 but the cache has no augmented references (cache_features.py --ref-augs)")
+        for j, i in enumerate(order):
+            if aug_on == "main" and (row.get("main") is None or i != row["main"]):
+                continue
+            if rng.random() < aug_prob:
+                augs[j] = rng.randrange(store.ref_augs)
+    refs = [store.ref(row["inputs"][i], a) for i, a in zip(order, augs)]
     key = prompt_key(main_pos, role_mode)
     return {"refs": refs, "target": store.target(target_path), "main_pos": main_pos, "prompt_key": key,
-            "prompt": store.prompt(key), "pool": row["pool"], "id": row["id"], "order": order}
+            "prompt": store.prompt(key), "pool": row["pool"], "id": row["id"], "order": order, "augs": augs}
 
 
 def load_rows(data_dir, split: str):

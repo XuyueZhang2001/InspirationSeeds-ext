@@ -1,7 +1,9 @@
 """
 score_sweep.py -- score the decompose.py folders of a sweep and pick, per source image, the folder for
 the no-main pool (level 1) and the folder for the main pool (level 2, replaces screen_sources.py).
-Last modified: 2026-11-23
+Last modified: 2026-11-27 (--gpus: the measurements and VLM answers are computed in one process per GPU,
+               each on its share of the source images; --shard, --cache-only)
+               2026-11-23
 
 Reads every folder with a groups.json under --sweep-root (run_sweep.sh writes
 <sweep-root>/topk64_c0.3_s1/<decompose.py folder>/). decompose.py is not changed. The source
@@ -84,13 +86,30 @@ Usage
     python score_sweep.py --image samples/sources/14.jpeg   # only the folders of one source image
     python score_sweep.py --leak 0.7 --min-objects 3        # other thresholds
     python score_sweep.py --export-no-main data/no_main --export-main generate_source
+    python score_sweep.py --image-dir samples/sources --gpus 0-7   # first scoring of many images on 8 GPUs
+
+Several GPUs (--gpus)
+    --gpus 2,3 (or 0-7) starts one process per listed GPU with --shard i/n --cache-only. The source images
+    are split round-robin (sorted stems), so all folders of one image are handled by the same process and its
+    cascade is the same as in a single run. Each process only fills the caches of its images (measure.json,
+    _sources/<stem>.json, main_choice.json; same-kind answers in _sources/same_kind_shard_<i>of<n>.json, so
+    the processes never write the same file); logs in <sweep-root>/_logs/score_shard_<i>of<n>.log. When all
+    are done, this process merges the same-kind answers into _sources/same_kind.json and runs the normal
+    scoring on the first listed GPU: everything is cached, so it only selects, writes score.json, draws the
+    review and exports if asked (and computes whatever a failed shard left out). --gpus 3 runs everything in
+    one process on GPU 3. --shard i/n --cache-only can also be started by hand (e.g. on another machine);
+    then run once more without them. Later runs (thresholds, overrides, export) need no --gpus: they only
+    read the caches.
 """
 
 import argparse
 import csv
 import itertools
 import json
+import os
 import shutil
+import subprocess
+import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -151,6 +170,13 @@ def parse_args():
     p.add_argument("--overview-rows", type=int, default=20, help="Rows per overview page")
     p.add_argument("--dino-model", default="facebook/dinov2-base")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--gpus", default=None,
+                   help="'3': run on GPU 3; '2,3' or '0-7': measurements and VLM answers in one process per GPU "
+                        "(source images split between them), then selection / review / export in this process")
+    p.add_argument("--shard", default=None, help="i/n: only the i-th of n parts of the source images (0-based)")
+    p.add_argument("--cache-only", action="store_true",
+                   help="Only fill the caches (measure.json, inventories, main_choice.json, same-kind answers); "
+                        "no score.json, review or export (used by --gpus)")
     # thresholds
     p.add_argument("--min-rel", type=float, default=0.4, help="unrelated if rel_clip < this")
     p.add_argument("--max-rel", type=float, default=0.92, help="source_copy if rel_clip > this")
@@ -607,8 +633,107 @@ def load_json(path: Path, fresh):
     return None
 
 
+# --------------------------------------------------------------------------------------
+# several GPUs
+# --------------------------------------------------------------------------------------
+def parse_gpus(text: str):
+    """'3' -> [3]; '2,3' -> [2, 3]; '0-7' -> [0, ..., 7]; '0,2-3' -> [0, 2, 3]."""
+    gpus = []
+    for part in (x.strip() for x in text.split(",")):
+        if "-" in part:
+            a, b = part.split("-")
+            gpus.extend(range(int(a), int(b) + 1))
+        elif part:
+            gpus.append(int(part))
+    if not gpus or len(set(gpus)) != len(gpus):
+        raise ValueError(f"--gpus {text!r}: give distinct GPU indices, e.g. 3, 2,3 or 0-7")
+    return gpus
+
+
+def parse_shard(text: str):
+    """'1/4' -> (1, 4): the second of four parts (0-based)."""
+    i, n = (int(x) for x in text.split("/"))
+    if not (n >= 1 and 0 <= i < n):
+        raise ValueError(f"--shard {text!r}: expected i/n with 0 <= i < n")
+    return i, n
+
+
+def strip_options(argv, names, flags=()):
+    """Remove the given options (and their values) and the given flags from an argument list."""
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a in names:
+            skip = True
+        elif a in flags or any(a.startswith(name + "=") for name in names):
+            continue
+        else:
+            out.append(a)
+    return out
+
+
+def launch_cache_shards(args, gpus) -> bool:
+    """One --cache-only child per GPU on its share of the source images; True if all succeeded."""
+    n = len(gpus)
+    logs = args.sweep_root / "_logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    # the children only fill caches: no export, no --gpus / --shard of their own
+    base = strip_options(sys.argv[1:], ("--gpus", "--shard", "--export-no-main", "--export-main"), ("--cache-only",))
+    procs = []
+    for i, g in enumerate(gpus):
+        cmd = [sys.executable, os.path.abspath(__file__)] + base + ["--shard", f"{i}/{n}", "--cache-only"]
+        log_path = logs / f"score_shard_{i}of{n}.log"
+        log = open(log_path, "w")
+        proc = subprocess.Popen(cmd, env=dict(os.environ, CUDA_VISIBLE_DEVICES=str(g)), stdout=log,
+                                stderr=subprocess.STDOUT)
+        procs.append((i, g, proc, log, log_path))
+        print(f"cache shard {i}/{n} on GPU {g}: log {log_path}")
+    print("waiting for all shards (follow a log with: tail -f <log>)")
+    t0, ok = time.time(), True
+    for i, g, proc, log, log_path in procs:
+        code = proc.wait()
+        log.close()
+        print(f"cache shard {i}/{n} on GPU {g} finished with exit code {code} after {time.time() - t0:.0f} s")
+        if code != 0:
+            ok = False
+            print(f"[warn] see {log_path}; the final pass computes what this shard left out")
+    return ok
+
+
+def kinds_shard_path(sweep_root: Path, shard) -> Path:
+    return sweep_root / "_sources" / f"same_kind_shard_{shard[0]}of{shard[1]}.json"
+
+
+def load_kinds(sweep_root: Path, args, shard) -> dict:
+    """Cached same-kind answers: same_kind.json plus every shard file (a shard reads only its own file)."""
+    fresh = lambda d: d.get("model") == args.vlm_model and not args.reask
+    kinds = load_json(sweep_root / "_sources" / "same_kind.json", fresh) or {"model": args.vlm_model}
+    paths = [kinds_shard_path(sweep_root, shard)] if shard else \
+        sorted((sweep_root / "_sources").glob("same_kind_shard_*.json"))
+    for path in paths:
+        kinds.update(load_json(path, fresh) or {})
+    return kinds
+
+
 def main():
     args = parse_args()
+    shard = parse_shard(args.shard) if args.shard else None
+    if args.gpus is not None:
+        gpus = parse_gpus(args.gpus)
+        if len(gpus) > 1:
+            if shard is not None or args.cache_only:
+                raise ValueError("--gpus with several GPUs starts its own shards: do not combine it with "
+                                 "--shard or --cache-only")
+            launch_cache_shards(args, gpus)
+            args.remeasure = args.reask = False  # the caches were just (re)computed by the shards
+        # this process (selection / review / export, leftovers) runs on the first listed GPU;
+        # set before CUDA is initialized
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[0])
+    run(args, shard)
+
+
+def run(args, shard):
     stems = None
     if args.image:
         stems = {Path(args.image).stem}
@@ -617,12 +742,22 @@ def main():
     folders = find_folders(args.sweep_root, stems)
     if not folders:
         raise SystemExit(f"no decomposition folders (groups.json) under {args.sweep_root}")
+    if shard is not None:
+        # split by source image, so the cascade of an image runs in one process (same result as one run)
+        stem_of = lambda item: Path(item[1].get("image", item[0].name)).stem
+        mine = set(sorted({stem_of(x) for x in folders})[shard[0]::shard[1]])
+        folders = [x for x in folders if stem_of(x) in mine]
+        print(f"shard {shard[0]}/{shard[1]}: {len(mine)} source image(s), {len(folders)} folder(s)")
+        if not folders:
+            return
     t0, counts = time.time(), Counter()
     enc = vlm = None
     vlm_fresh = lambda d: args.reask is False and d.get("model") == args.vlm_model and \
         d.get("prompt_version") == PROMPT_VERSION
-    kinds_path = args.sweep_root / "_sources" / "same_kind.json"
-    kinds = load_json(kinds_path, lambda d: d.get("model") == args.vlm_model and not args.reask) or {"model": args.vlm_model}
+    # a shard writes its same-kind answers to its own file (the processes never write the same file);
+    # the final pass merges every shard file into same_kind.json
+    kinds_path = kinds_shard_path(args.sweep_root, shard) if shard else args.sweep_root / "_sources" / "same_kind.json"
+    kinds = load_kinds(args.sweep_root, args, shard)
 
     def get_vlm():
         nonlocal vlm
@@ -704,6 +839,15 @@ def main():
                 best["main"] = max(best["main"], r["score"])
     kinds_path.parent.mkdir(parents=True, exist_ok=True)
     kinds_path.write_text(json.dumps(kinds, indent=1))
+    if args.cache_only:
+        n_images = len({r["stem"] for r in recs})
+        print(f"cache only: {len(recs)} folder(s) of {n_images} image(s) in {time.time() - t0:.0f} s; new work: "
+              + (", ".join(f"{k} {v}" for k, v in counts.items()) or "none (all cached)"))
+        return
+    if shard is None:
+        # every shard answer is now in same_kind.json
+        for path in (args.sweep_root / "_sources").glob("same_kind_shard_*.json"):
+            path.unlink()
 
     # ---------------- picks, review, export ----------------
     select(recs, read_overrides(args.sweep_root / "overrides.csv"))

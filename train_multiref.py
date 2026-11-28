@@ -1,6 +1,7 @@
 """
 train_multiref.py -- LoRA (+ main-image role embedding) fine-tuning of FLUX.1 Kontext dev with 2-4 references.
-Last modified: 2026-11-25 (several GPUs: data parallel with torchrun or --gpus; gradients of the trainable
+Last modified: 2026-11-26 (--ref-aug-prob / --ref-aug-on: reference augmentation from the cache)
+               2026-11-25 (several GPUs: data parallel with torchrun or --gpus; gradients of the trainable
                parameters averaged over the GPUs after every optimizer step)
                2026-11-22 (--overfit-folders: overfitting test on named folders; default --main-t 2 -> 3)
                2026-11-20 (default --role embed -> tid)
@@ -46,6 +47,20 @@ Sigma sampling of the designated samples
     sigma 0.73). Unspecified samples keep --weighting-scheme. The loss weighting is unchanged.
     Note: --weighting-scheme logit_normal indexes the DESCENDING sigma table with u, so there a
     positive --logit-mean favours LOW sigma (as in the diffusers example).
+
+Reference augmentation (--ref-aug-prob, default 0 = off)
+    The targets of the designated pool are synthesized from the main input (img2img), so they share
+    its layout pixel by pixel; a model can lower the loss by redrawing the marked reference, which
+    the copy-rate evaluation of runs/v2_auto showed (copy 0.89 at step 12000). With
+    --ref-aug-prob p every reference of a TRAINING sample is replaced independently with
+    probability p by one of the augmented versions from the cache (horizontal flip / random square
+    crop, made by cache_features.py --ref-augs N); the target is unchanged. Copying the main
+    reference then no longer matches the target, so the model has to carry over what the main
+    image shows, not where its pixels are. --ref-aug-on main augments only the main reference
+    (for comparison; "augmented" then correlates with "main", which does not hold at inference).
+    Validation loss, designation gap and sample images always use the original references, so
+    runs with and without augmentation are directly comparable. Logged: ref_aug_share (share of
+    augmented references in the training samples).
 
 Trainable parameters: LoRA on the attention / feed-forward layers INSIDE the transformer
 blocks (the final output projection, also named proj_out, is excluded) and E_main.
@@ -110,6 +125,9 @@ Usage
 
     # full run
     python train_multiref.py --data-dir data/multiref --output-dir runs/v1 --max-steps 10000
+
+    # with reference augmentation (first: cache_features.py --ref-augs 4)
+    python train_multiref.py --data-dir data/multiref --output-dir runs/v3_aug --ref-aug-prob 0.5
 
 Several GPUs (data parallel)
     python train_multiref.py --gpus 0,1,2,3 ...            # restarts itself with torchrun on GPUs 0-3
@@ -201,6 +219,11 @@ def parse_args():
                         "train and val split), filled up with random unspecified samples to N")
     g.add_argument("--no-shuffle", action="store_true", help="Keep the input order fixed (debugging)")
     g.add_argument("--preload", action="store_true", help="Keep all cached latents in memory")
+    g.add_argument("--ref-aug-prob", type=float, default=0.0,
+                   help="Probability that a reference of a training sample is replaced by an augmented "
+                        "version from the cache (cache_features.py --ref-augs; 0 = off)")
+    g.add_argument("--ref-aug-on", choices=["all", "main"], default="all",
+                   help="Augment every reference (default) or only the main reference")
 
     g = p.add_argument_group("model")
     g.add_argument("--base-model", default="black-forest-labs/FLUX.1-Kontext-dev")
@@ -755,8 +778,22 @@ def main():
     store = LatentStore(cache_dir)
     if store.config.get("base_model") != args.base_model:
         print(f"[warn] cache built with {store.config.get('base_model')}, training {args.base_model}")
+    if not 0.0 <= args.ref_aug_prob <= 1.0:
+        raise ValueError("--ref-aug-prob must be in [0, 1]")
+    n_augs = store.ref_augs if args.ref_aug_prob > 0 else 0
+    if args.ref_aug_prob > 0:
+        if store.ref_augs <= 0:
+            raise ValueError(f"--ref-aug-prob {args.ref_aug_prob} but {cache_dir} has no augmented references: "
+                             f"run cache_features.py --ref-augs N first")
+        print(f"reference augmentation: p = {args.ref_aug_prob} on {args.ref_aug_on} reference(s), "
+              f"{store.ref_augs} cached versions per input ({store.config.get('aug')})")
+    args.cache_ref_augs = store.ref_augs
+    args.cache_aug = store.config.get("aug")
     if args.preload:
-        store = LatentStore(cache_dir, all_latent_paths(train_rows + val_rows, store.ref_size, store.target_size))
+        # augmented versions are only used for training rows
+        paths = set(all_latent_paths(train_rows, store.ref_size, store.target_size, n_augs))
+        paths |= set(all_latent_paths(val_rows, store.ref_size, store.target_size))
+        store = LatentStore(cache_dir, sorted(paths, key=lambda t: (str(t[0]), t[1], -1 if t[2] is None else t[2])))
     for main_pos in [None] + list(range(4)):
         if args.role != "index" and main_pos not in (None, 0):
             continue
@@ -853,7 +890,10 @@ def main():
         p_unspec = schedule(step / args.max_steps)
         for _ in range(args.grad_accum):
             row, target = sampler.sample(p_unspec)
-            ex = make_example(row, target, store, args.role, data_rng, shuffle=not args.no_shuffle)
+            ex = make_example(row, target, store, args.role, data_rng, shuffle=not args.no_shuffle,
+                              aug_prob=args.ref_aug_prob, aug_on=args.ref_aug_on)
+            if args.ref_aug_prob > 0:
+                window["ref_aug_share"].append(sum(a is not None for a in ex["augs"]) / len(ex["augs"]))
             sigma = sample_sigma(args, sigmas, sigma_gen, ex["pool"])
             window[f"sigma_{ex['pool']}"].append(float(sigma))
             loss = forward_loss(transformer, role, ex, sigma, None, args)

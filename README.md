@@ -487,7 +487,10 @@ python score_sweep.py --image samples/sources/14.jpeg   # only the folders of on
 python score_sweep.py --image-dir samples/sources       # the folders of the images in a folder
 python score_sweep.py --leak 0.7 --min-objects 3        # other thresholds (cached, takes seconds)
 python score_sweep.py --export-no-main data/no_main --export-main generate_source
+python score_sweep.py --image-dir samples/sources --gpus 0-7   # first scoring of many images on 8 GPUs
 ```
+
+**Several GPUs** (`--gpus 2,3` or `0-7`): one process per listed GPU with `--shard i/n --cache-only` fills the caches of its share of the source images (split round-robin by stem, so all folders of an image are in one process and the cascade is the same as in a single run); logs in `<sweep-root>/_logs/score_shard_<i>of<n>.log`. Same-kind answers go to `_sources/same_kind_shard_<i>of<n>.json` (no two processes write one file) and are merged into `same_kind.json` afterwards. When all shards are done, the launching process scores everything from the caches on the first listed GPU: selection, `score.json`, review and export (if asked). Only the first scoring is slow (about 5–10 s per source image on one A100, mostly the VLM); later runs (thresholds, overrides, export) read the caches and need no `--gpus`. `--shard i/n --cache-only` can also be started by hand; then run once more without them.
 
 Every measurement and VLM answer is cached (`measure.json`, `main_choice.json`, `_sources/`); changing a threshold and rerunning takes seconds (the VLM may be asked about a few more folders if the picks change). `--remeasure` recomputes the CLIP / DINOv2 measurements, `--reask` asks the VLM again. Cached VLM answers are also asked again when `--vlm-model` or the prompts (`PROMPT_VERSION` in the script) change.
 
@@ -515,6 +518,8 @@ Every measurement and VLM answer is cached (`measure.json`, `main_choice.json`, 
 | `--min-objects` | 2 | `main_ok` needs this many different prominent objects |
 | `--overview-rows` | 20 | Rows per overview page |
 | `--remeasure`, `--reask` | off | Ignore the cached measurements / VLM answers |
+| `--gpus` | – | `3`: everything on GPU 3; `2,3` / `0-7`: measurements and VLM answers in one process per GPU, then selection / review / export in this process |
+| `--shard`, `--cache-only` | – | `i/n`: only the i-th of n parts of the source images; only fill the caches (used by `--gpus`, can be started by hand) |
 
 ### Output
 
@@ -924,6 +929,8 @@ Output (`--output-dir`, default `data/multiref`): `train.jsonl`, `val.jsonl` (on
 
 **After a change in `keep/`, rerun `build_dataset.py` and then `cache_features.py`**: newly kept files are new paths and must be cached before training.
 
+**Augmented references** (`--ref-augs N`, for `train_multiref.py --ref-aug-prob`): N extra latents per input image (targets are never augmented), `<cache-dir>/latents/<key>_aug<v>.pt`. Version 0 is the horizontal flip of the whole image; versions ≥ 1 are a random square crop (area in [`--aug-crop-min`, 1], random position), flipped with probability `--aug-flip-prob`, resized to `--ref-size`. No color changes, so attribute mains (color, texture, style) survive. The parameters of version v depend only on (`--aug-seed`, path, v): a larger N later only adds versions; other `--aug-*` settings on a cache that already has versions are refused unless `--overwrite`. `--aug-preview K` writes `<cache-dir>/aug_preview.jpeg` (original + every version for K inputs) to check that the crops keep the subject. Rerunning without `--ref-augs` keeps the cache's augmentation setting.
+
 ### Usage and parameters
 
 ```bash
@@ -943,6 +950,9 @@ python cache_features.py --manifest-dir data/multiref --target-size 1024
 | | `--ref-size`, `--target-size` | 512, 1024 | Resolution of the references and of the targets |
 | | `--base-model` | `black-forest-labs/FLUX.1-Kontext-dev` | VAE and text encoders |
 | | `--overwrite` | off | Recompute existing latents |
+| | `--ref-augs` | 0 | Augmented versions per input (0 = keep the cache's current setting) |
+| | `--aug-crop-min`, `--aug-flip-prob`, `--aug-seed` | 0.6, 0.5, 0 | Smallest crop area, flip probability of versions ≥ 1, seed |
+| | `--aug-preview` | 0 | Inputs shown in `aug_preview.jpeg` |
 
 ---
 
@@ -1026,6 +1036,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 train_mult
 - **Samples per optimizer step** = `--grad-accum` × number of GPUs (printed at the start, `world_size` in `args.json`). 4 GPUs with `--grad-accum 1` give the 4 samples per step of a single-GPU run with `--grad-accum 4` in about a quarter of the time; keeping `--grad-accum 4` on 4 GPUs gives 16 samples per step (fewer, larger steps: adjust `--max-steps` / `--lr`).
 - **Resume** with the same number of GPUs restores every GPU's random state; with another number the states are reseeded from the step (a warning is printed).
 - Checkpoints are in the same format as single-GPU runs (`eval_multiref.py`, `generate_multi.py` unchanged).
+
+### Reference augmentation
+
+The designated targets are img2img results started from the main input, so they share its layout pixel by pixel, and redrawing the marked reference already lowers the loss. `runs/v2_auto` learned exactly that: at step 12000, 89 % of the validation outputs were closer to the main input than to the target (cos(output, main) 0.82 vs cos(target, main) 0.72), while without a main nothing was copied. With `--ref-aug-prob p` every reference of a training sample is replaced independently with probability p by a random augmented version from the cache (flip / crop, `cache_features.py --ref-augs`); the target stays the same, so a pixel copy of the main reference no longer matches it and the model has to carry over *what* the main image shows rather than *where* its pixels are. `--ref-aug-on main` augments only the main reference (comparison only: "augmented" then signals "main", which never happens at inference). Validation loss, designation gap and sample images use the original references, so runs with and without augmentation are directly comparable; `ref_aug_share` in the log is the share of augmented references. Augmentation removes the pixel-copy shortcut but not copy-like targets: use it together with a stricter target selection.
+
+```bash
+python cache_features.py --manifest-dir data/multiref --ref-augs 4 --aug-preview 8
+python train_multiref.py --data-dir data/multiref --output-dir runs/v3_aug --ref-aug-prob 0.5 ...
+```
 
 ### Overfitting test
 
@@ -1115,6 +1134,7 @@ Output (default `<checkpoint>/eval/`): `summary.json` (overall and per $\sigma$,
 | `--unspec-schedule` | `0:1.0,0.3:1.0,0.4:0.65` (`0.5` with `--overfit`) | Probability of the unspecified pool over training progress (`progress:prob` points, linear in between; one value = constant) |
 | `--overfit` | 0 | Overfitting test on about N samples |
 | `--no-shuffle`, `--preload` | off | Fixed input order (debugging); keep all latents in memory |
+| `--ref-aug-prob`, `--ref-aug-on` | 0, `all` | Reference augmentation: probability per reference of a training sample, every reference or only the main one; needs `cache_features.py --ref-augs` (see *Reference augmentation*) |
 | `--base-model` | `black-forest-labs/FLUX.1-Kontext-dev` | Transformer weights |
 | `--role` | `tid` | Main-image designation: `tid`, `embed`, `slot`, `index` |
 | `--main-t` | 3 | Position id $t$ of the main reference with `--role tid` (the others have 1; 2 before 2026-11-22) |
@@ -1339,11 +1359,10 @@ With weights, the projection could contradict what is visible (e.g. `high,low` t
 ### Multi-reference fine-tuning (`train_multiref.py`)
 
 1. **Designation shown only on an overfitting subset** (see *Current findings*): with `tid` ($t = 3$) it is learned on one designated folder (3 of 4 mains); generalization is untested. `index` did not learn it, `slot` learned a first-position shortcut, `embed` learned it more slowly.
-2. **Copying the main input.** Kontext tends to copy one reference (the base model copies the same input under every condition); when a designated target is ambiguous, the model falls back to that copy. Select targets by the *Selection criteria* and check the copy rate of a full run (`eval_multiref.py`: `copy_rate`, `copy_overview.jpeg`).
+2. **Copying the main input.** Kontext tends to copy one reference (the base model copies the same input under every condition); when a designated target is ambiguous, the model falls back to that copy. `runs/v2_auto` (200 sources, 12000 steps) copied the main input in 89 % of the validation outputs (near copy 61 %), more than its targets resemble the main input, although it picked the right input every time (`input_acc`, `target_acc` 1.00). Countermeasures: `--ref-aug-prob` (see *Reference augmentation*), a stricter copy gate and a capped structure term in `score_synth.py`, and checkpoints chosen by the validation copy rate (`eval_multiref.py`: `copy_rate`, `copy_overview.jpeg`).
 3. **Quality gap between the pools.** Unspecified targets are real images, designated targets are Kandinsky images; the model could associate "designated" with the Kandinsky look. Compare the image quality of both modes on validation folders.
-4. **Single GPU only**; no multi-GPU or distributed training.
-5. **`--init-lora`** needs the same rank and target layers; the paper's AI-Toolkit LoRA may not match (the number of unexpected keys is printed).
-6. **Sample images are slow** (28 denoising steps per condition, ≈ 25 s per logging interval in which they are made); use `--no-images-at-start` or a larger `--image-every` for long runs.
+4. **`--init-lora`** needs the same rank and target layers; the paper's AI-Toolkit LoRA may not match (the number of unexpected keys is printed).
+5. **Sample images are slow** (28 denoising steps per condition, ≈ 25 s per logging interval in which they are made); use `--no-images-at-start` or a larger `--image-every` for long runs.
 
 ---
 
